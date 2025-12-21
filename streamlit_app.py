@@ -417,13 +417,19 @@ def main():
     
     st.markdown("""
     <style>
-    /* Make the main app background dark gray so white pages pop */
-    .stApp {
-        background-color: #555555;
+    /* 1. Change the RIGHT PANEL (Main Content) background to light gray */
+    [data-testid="stAppViewContainer"] {
+        background-color: #e5e5e5;
     }
-    /* Force white text for labels since background is dark */
-    .stMarkdown, .stText, h1, h2, h3, label, .stButton {
-        color: white !important;
+    
+    /* 2. Change the LEFT PANEL (Sidebar) background to a slightly different gray */
+    [data-testid="stSidebar"] {
+        background-color: #dcdcdc;
+    }
+    
+    /* 3. Fix text color so it's readable on gray */
+    .stMarkdown, .stText, h1, h2, h3, p, li {
+        color: #000000 !important;
     }
     </style>
     """, unsafe_allow_html=True)
