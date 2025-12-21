@@ -417,18 +417,23 @@ def main():
     
     st.markdown("""
     <style>
-    /* 1. Change the RIGHT PANEL (Main Content) background to light gray */
-    [data-testid="stAppViewContainer"] {
-        background-color: #e5e5e5;
+    /* 1. FORCE Main Background Color */
+    .stApp, [data-testid="stAppViewContainer"] {
+        background-color: #dcdcdc !important;
     }
-    
-    /* 2. Change the LEFT PANEL (Sidebar) background to a slightly different gray */
+
+    /* 2. FORCE Sidebar Background Color (to match) */
     [data-testid="stSidebar"] {
-        background-color: #dcdcdc;
+        background-color: #dcdcdc !important;
     }
-    
-    /* 3. Fix text color so it's readable on gray */
-    .stMarkdown, .stText, h1, h2, h3, p, li {
+
+    /* 3. Make the top header transparent so it doesn't look like a white bar */
+    [data-testid="stHeader"] {
+        background-color: rgba(0,0,0,0) !important;
+    }
+
+    /* 4. Fix text color */
+    .stMarkdown, .stText, h1, h2, h3, p, li, span {
         color: #000000 !important;
     }
     </style>
