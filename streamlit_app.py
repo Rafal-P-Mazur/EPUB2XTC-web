@@ -417,18 +417,16 @@ def main():
     
     st.markdown("""
     <style>
-    /* Target the image elements to add a shadow and border */
-    [data-testid="stImage"] img {
-        border: 1px solid #ccc;
-        box-shadow: 5px 5px 15px rgba(0,0,0,0.2);
+    /* Make the main app background dark gray so white pages pop */
+    .stApp {
+        background-color: #555555;
     }
-    /* Optional: Change the background of the preview area to light gray */
-    .block-container {
-        background-color: #f9f9f9;
+    /* Force white text for labels since background is dark */
+    .stMarkdown, .stText, h1, h2, h3, label, .stButton {
+        color: white !important;
     }
     </style>
     """, unsafe_allow_html=True)
-    # --------------------------
     
 
     
