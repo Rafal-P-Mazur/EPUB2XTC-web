@@ -91,13 +91,7 @@ def hyphenate_html_text(soup, language_code):
             continue
 
         original_text = str(text_node)
-
-        # --- FIX: FORCE NORMAL SPACES ---
-        # 1. Replace Non-Breaking Space (\u00A0) with a standard space.
-        # This allows the "Justify" alignment to stretch this space evenly with the others.
         clean_text = original_text.replace('\u00A0', ' ')
-
-        # --------------------------------
 
         def replace_match(match):
             word = match.group(0)
@@ -124,8 +118,9 @@ class EpubProcessor:
         self.is_ready = False
         self.temp_dir = tempfile.TemporaryDirectory() # Auto-cleanup temp dir
 
+    # --- CHANGED: Added orientation parameter ---
     def load_and_layout(self, epub_bytes, font_path, font_size, margin, line_height, font_weight,
-                        bottom_padding, top_padding, text_align="justify", add_toc=True):
+                        bottom_padding, top_padding, text_align="justify", orientation="Portrait", add_toc=True):
         
         self.font_path = font_path
         self.font_size = font_size
@@ -135,8 +130,14 @@ class EpubProcessor:
         self.bottom_padding = bottom_padding
         self.top_padding = top_padding
         self.text_align = text_align
-        self.screen_width = DEFAULT_SCREEN_WIDTH
-        self.screen_height = DEFAULT_SCREEN_HEIGHT
+        
+        # --- CHANGED: Swap Dimensions Logic ---
+        if orientation == "Landscape":
+            self.screen_width = DEFAULT_SCREEN_HEIGHT  # 800
+            self.screen_height = DEFAULT_SCREEN_WIDTH  # 480
+        else:
+            self.screen_width = DEFAULT_SCREEN_WIDTH   # 480
+            self.screen_height = DEFAULT_SCREEN_HEIGHT # 800
 
         # Close existing docs
         for doc, _ in self.fitz_docs: doc.close()
@@ -153,11 +154,7 @@ class EpubProcessor:
             st.error(f"Error reading EPUB: {e}")
             return False
 
-        # Font handling for CSS
         if self.font_path and os.path.exists(self.font_path):
-            # We need to copy the font to a temp path accessible by the renderer
-            # But for simplicity, we assume font_path is a valid system path or uploaded path
-            # In a web context, we might embed base64 font, but here we link normally
             css_font_path = self.font_path.replace("\\", "/")
             font_face_rule = f'@font-face {{ font-family: "CustomFont"; src: url("{css_font_path}"); }}'
             font_family_val = '"CustomFont"'
@@ -165,10 +162,16 @@ class EpubProcessor:
             font_face_rule = ""
             font_family_val = "serif"
 
+        # --- CHANGED: Injected @page size into CSS ---
         custom_css = f"""
         <style>
             {font_face_rule}
-            @page {{ margin: 0; }}
+            
+            @page {{ 
+                size: {self.screen_width}pt {self.screen_height}pt; 
+                margin: 0; 
+            }}
+
             body, p, div, span, li, blockquote, dd, dt {{
                 font-family: {font_family_val} !important;
                 font-size: {self.font_size}pt !important;
@@ -182,6 +185,8 @@ class EpubProcessor:
                 margin: 0 !important;
                 padding: {self.margin}px !important;
                 background-color: white !important;
+                width: 100% !important;
+                height: 100% !important;
             }}
             img {{ max-width: 95% !important; height: auto !important; display: block; margin: 50px auto !important; }}
             h1, h2, h3 {{ 
@@ -243,11 +248,19 @@ class EpubProcessor:
                 f.write(final_html)
 
             doc = fitz.open(temp_html_path)
+
+            # --- CHANGED: FORCE REFLOW (The Fix) ---
+            # This ensures PyMuPDF recalculates the layout for the new dimensions
+            rect = fitz.Rect(0, 0, self.screen_width, self.screen_height)
+            doc.layout(rect=rect)
+            # ---------------------------------------
+
             self.fitz_docs.append((doc, has_image))
             for i in range(len(doc)): self.page_map.append((len(self.fitz_docs) - 1, i))
             running_page_count += len(doc)
 
         if add_toc:
+            # Recalculate TOC sizes based on new width/height
             toc_header_space = 100 + self.top_padding
             toc_row_height = 35
             available_h = self.screen_height - self.bottom_padding - toc_header_space
@@ -338,6 +351,8 @@ class EpubProcessor:
             pix = page.get_pixmap(matrix=mat, alpha=False)
 
             img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            
+            # --- CHANGED: Use dynamic screen width ---
             img_content = img_content.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert("L")
 
             img = Image.new("RGB", (self.screen_width, self.screen_height), (255, 255, 255))
@@ -414,7 +429,6 @@ class EpubProcessor:
 def main():
     st.set_page_config(page_title="EPUB to XTC Web Converter", layout="wide")
     
-    
     st.markdown("""
     <style>
     /* 1. FORCE Main Background Color */
@@ -440,7 +454,6 @@ def main():
     """, unsafe_allow_html=True)
     
 
-    
     st.title("EPUB to XTC Converter (Web)")
 
     # Sidebar for inputs
@@ -449,6 +462,9 @@ def main():
         uploaded_file = st.file_uploader("Upload EPUB", type=["epub"])
         
         uploaded_font = st.file_uploader("Upload Custom Font (TTF)", type=["ttf"])
+        
+        # --- CHANGED: Added Orientation Selector ---
+        orientation = st.selectbox("Orientation", ["Portrait", "Landscape"])
         
         # Checkbox for TOC
         use_toc = st.checkbox("Generate TOC Pages", value=True)
@@ -487,7 +503,10 @@ def main():
                 uploaded_file.getvalue(),
                 font_path,
                 font_size, margin, line_height, font_weight,
-                bot_pad, top_pad, text_align, use_toc
+                bot_pad, top_pad, text_align, 
+                # --- CHANGED: Passing orientation ---
+                orientation, 
+                use_toc
             )
             
             if success:
@@ -518,7 +537,6 @@ def main():
             # Render Image
             img = st.session_state.processor.render_page(st.session_state.current_page)
             
-            # --- START NEW CODE ---
             # Create a copy for the preview so we don't mess up the actual file export
             preview_img = img.copy()
             
@@ -527,10 +545,9 @@ def main():
             width, height = preview_img.size
             # Draw rectangle: (x0, y0, x1, y1), outline=color, width=thickness
             draw.rectangle([(0, 0), (width - 1, height - 1)], outline="black", width=4)
-            # --- END NEW CODE ---
 
-            # Display the PREVIEW image (the one with the border)
-            st.image(preview_img, caption=f"Page {st.session_state.current_page + 1}", use_column_width=False, width=400)
+            # --- CHANGED: Removed hardcoded width=400 to allow Streamlit to size landscape images better ---
+            st.image(preview_img, caption=f"Page {st.session_state.current_page + 1}", use_column_width=False)
 
         with col2:
             st.subheader("Export")
