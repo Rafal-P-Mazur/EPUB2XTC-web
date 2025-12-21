@@ -84,18 +84,31 @@ def hyphenate_html_text(soup, language_code):
 
     word_pattern = re.compile(r'\w+', re.UNICODE)
 
-    def replace_match(match):
-        word = match.group(0)
-        if len(word) < 6: return word
-        return dic.inserted(word, hyphen='\u00AD')
-
     for text_node in soup.find_all(string=True):
-        if text_node.parent.name in ['script', 'style', 'head', 'title', 'meta']: continue
-        if not text_node.strip(): continue
+        if text_node.parent.name in ['script', 'style', 'head', 'title', 'meta']:
+            continue
+        if not text_node.strip():
+            continue
+
         original_text = str(text_node)
-        new_text = word_pattern.sub(replace_match, original_text)
+
+        # --- FIX: FORCE NORMAL SPACES ---
+        # 1. Replace Non-Breaking Space (\u00A0) with a standard space.
+        # This allows the "Justify" alignment to stretch this space evenly with the others.
+        clean_text = original_text.replace('\u00A0', ' ')
+
+        # --------------------------------
+
+        def replace_match(match):
+            word = match.group(0)
+            if len(word) < 6: return word
+            return dic.inserted(word, hyphen='\u00AD')
+
+        new_text = word_pattern.sub(replace_match, clean_text)
+
         if new_text != original_text:
             text_node.replace_with(NavigableString(new_text))
+
     return soup
 
 # --- PROCESSING ENGINE (Modified for Web) ---
