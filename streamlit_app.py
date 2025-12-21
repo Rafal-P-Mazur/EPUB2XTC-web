@@ -517,7 +517,20 @@ def main():
             
             # Render Image
             img = st.session_state.processor.render_page(st.session_state.current_page)
-            st.image(img, caption=f"Page {st.session_state.current_page + 1}", use_column_width=False, width=400)
+            
+            # --- START NEW CODE ---
+            # Create a copy for the preview so we don't mess up the actual file export
+            preview_img = img.copy()
+            
+            # Draw a black border directly onto the pixels
+            draw = ImageDraw.Draw(preview_img)
+            width, height = preview_img.size
+            # Draw rectangle: (x0, y0, x1, y1), outline=color, width=thickness
+            draw.rectangle([(0, 0), (width - 1, height - 1)], outline="black", width=4)
+            # --- END NEW CODE ---
+
+            # Display the PREVIEW image (the one with the border)
+            st.image(preview_img, caption=f"Page {st.session_state.current_page + 1}", use_column_width=False, width=400)
 
         with col2:
             st.subheader("Export")
