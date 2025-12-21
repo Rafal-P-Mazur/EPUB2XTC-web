@@ -414,6 +414,24 @@ class EpubProcessor:
 def main():
     st.set_page_config(page_title="EPUB to XTC Web Converter", layout="wide")
     
+    
+    st.markdown("""
+    <style>
+    /* Target the image elements to add a shadow and border */
+    [data-testid="stImage"] img {
+        border: 1px solid #ccc;
+        box-shadow: 5px 5px 15px rgba(0,0,0,0.2);
+    }
+    /* Optional: Change the background of the preview area to light gray */
+    .block-container {
+        background-color: #f9f9f9;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+    # --------------------------
+    
+
+    
     st.title("EPUB to XTC Converter (Web)")
 
     # Sidebar for inputs
