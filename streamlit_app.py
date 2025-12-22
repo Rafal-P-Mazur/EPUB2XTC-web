@@ -429,30 +429,52 @@ class EpubProcessor:
 def main():
     st.set_page_config(page_title="EPUB to XTC Web Converter", layout="wide")
     
-    st.markdown("""
+   st.markdown("""
     <style>
-    /* 1. FORCE Main Background Color */
-    .stApp, [data-testid="stAppViewContainer"] {
-        background-color: #dcdcdc !important;
-    }
-
-    /* 2. FORCE Sidebar Background Color (to match) */
-    [data-testid="stSidebar"] {
-        background-color: #dcdcdc !important;
-    }
-
-    /* 3. Make the top header transparent so it doesn't look like a white bar */
+    /* --- 1. CLEAN UP HEADERS --- */
     [data-testid="stHeader"] {
-        background-color: rgba(0,0,0,0) !important;
+        background-color: transparent !important;
     }
 
-    /* 4. Fix text color */
-    .stMarkdown, .stText, h1, h2, h3, p, li, span {
-        color: #000000 !important;
+    /* --- 2. LIGHT MODE (Modern & Clean) --- */
+    @media (prefers-color-scheme: light) {
+        /* Main Area: Very soft off-white/blue-ish gray (Professional look) */
+        .stApp, [data-testid="stAppViewContainer"] {
+            background-color: #f0f2f6 !important;
+        }
+        
+        /* Sidebar: Pure white for contrast */
+        [data-testid="stSidebar"] {
+            background-color: #ffffff !important;
+            border-right: 1px solid #e0e0e0;
+        }
+        
+        /* Text: Dark slate (easier on eyes than pure black) */
+        h1, h2, h3, p, li, span, .stMarkdown, .stText, label, .stButton {
+            color: #31333F !important;
+        }
+    }
+
+    /* --- 3. DARK MODE (Easy on eyes) --- */
+    @media (prefers-color-scheme: dark) {
+        /* Main Area: Deep Charcoal */
+        .stApp, [data-testid="stAppViewContainer"] {
+            background-color: #0e1117 !important;
+        }
+        
+        /* Sidebar: Slightly lighter dark for separation */
+        [data-testid="stSidebar"] {
+            background-color: #262730 !important;
+            border-right: 1px solid #444;
+        }
+        
+        /* Text: Off-white */
+        h1, h2, h3, p, li, span, .stMarkdown, .stText, label, .stButton {
+            color: #fafafa !important;
+        }
     }
     </style>
     """, unsafe_allow_html=True)
-    
 
     st.title("EPUB to XTC Converter (Web)")
 
