@@ -475,7 +475,7 @@ class EpubProcessor:
 # --- STREAMLIT APP ---
 
 def main():
-    st.set_page_config(page_title="EPUB to XTC Live", layout="wide")
+    st.set_page_config(page_title="EPUB to XTC Live", layout="wide", initial_sidebar_state="expanded")
 
     # CSS to increase Sidebar Width and hide default headers
     st.markdown("""
