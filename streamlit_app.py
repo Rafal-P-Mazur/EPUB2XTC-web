@@ -482,7 +482,22 @@ def main():
     <style>
         section[data-testid="stSidebar"] { width: 400px !important; }
         .block-container { padding-top: 1rem; padding-bottom: 1rem; }
-        header[data-testid="stHeader"] { height: 0; visibility: hidden; }
+        
+        /* REMOVED: header[data-testid="stHeader"] { height: 0; visibility: hidden; } 
+           The line above was hiding the button to re-open the sidebar.
+           
+           Use the lines below instead if you want a cleaner look but 
+           still want the sidebar menu button to be visible:
+        */
+        
+        header[data-testid="stHeader"] {
+            background-color: rgba(0,0,0,0); /* Transparent background */
+        }
+        
+        /* Optional: Hide the colored decoration line at the top */
+        header[data-testid="stHeader"] > div:first-child {
+            background: transparent;
+        }
     </style>
     """, unsafe_allow_html=True)
 
