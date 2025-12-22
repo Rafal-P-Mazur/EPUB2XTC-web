@@ -1,6 +1,5 @@
 import streamlit as st
 import os
-import sys
 import struct
 import fitz  # PyMuPDF
 from PIL import Image, ImageEnhance, ImageDraw, ImageFont
@@ -24,14 +23,15 @@ DEFAULT_FONT_WEIGHT = 400
 DEFAULT_BOTTOM_PADDING = 15
 DEFAULT_TOP_PADDING = 15
 
+
 # --- UTILITY FUNCTIONS ---
 
 def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
     if target_font_family is None:
         return css_text
-    # Simple regex to force font family
     css_text = re.sub(r'font-family\s*:\s*[^;!]+', f'font-family: {target_font_family}', css_text)
     return css_text
+
 
 def get_pil_font(font_path, size):
     try:
@@ -41,6 +41,7 @@ def get_pil_font(font_path, size):
     except:
         return ImageFont.load_default()
 
+
 def extract_all_css(book):
     css_rules = []
     for item in book.get_items_of_type(ebooklib.ITEM_STYLE):
@@ -49,6 +50,7 @@ def extract_all_css(book):
         except:
             pass
     return "\n".join(css_rules)
+
 
 def extract_images_to_base64(book):
     image_map = {}
@@ -61,8 +63,10 @@ def extract_images_to_base64(book):
             pass
     return image_map
 
+
 def get_official_toc_mapping(book):
     mapping = {}
+
     def process_toc_item(item):
         if isinstance(item, tuple):
             if len(item) > 1 and isinstance(item[1], list):
@@ -70,8 +74,10 @@ def get_official_toc_mapping(book):
         elif isinstance(item, epub.Link):
             clean_href = item.href.split('#')[0]
             mapping[clean_href] = item.title
+
     for item in book.toc: process_toc_item(item)
     return mapping
+
 
 def hyphenate_html_text(soup, language_code):
     try:
@@ -105,7 +111,8 @@ def hyphenate_html_text(soup, language_code):
 
     return soup
 
-# --- PROCESSING ENGINE (Modified for Web) ---
+
+# --- PROCESSING ENGINE ---
 
 class EpubProcessor:
     def __init__(self):
@@ -116,34 +123,32 @@ class EpubProcessor:
         self.total_pages = 0
         self.toc_items_per_page = 18
         self.is_ready = False
-        self.temp_dir = tempfile.TemporaryDirectory() # Auto-cleanup temp dir
+        self.temp_dir = tempfile.TemporaryDirectory()
 
-    # --- CHANGED: Added orientation parameter ---
     def load_and_layout(self, epub_bytes, font_path, font_size, margin, line_height, font_weight,
                         bottom_padding, top_padding, text_align="justify", orientation="Portrait", add_toc=True):
-        
+
         self.font_path = font_path
-        self.font_size = font_size
+        self.font_size = int(font_size)
         self.margin = margin
         self.line_height = line_height
         self.font_weight = font_weight
         self.bottom_padding = bottom_padding
         self.top_padding = top_padding
         self.text_align = text_align
-        
-        # --- CHANGED: Swap Dimensions Logic ---
+
         if orientation == "Landscape":
             self.screen_width = DEFAULT_SCREEN_HEIGHT  # 800
             self.screen_height = DEFAULT_SCREEN_WIDTH  # 480
         else:
-            self.screen_width = DEFAULT_SCREEN_WIDTH   # 480
-            self.screen_height = DEFAULT_SCREEN_HEIGHT # 800
+            self.screen_width = DEFAULT_SCREEN_WIDTH  # 480
+            self.screen_height = DEFAULT_SCREEN_HEIGHT  # 800
 
         # Close existing docs
         for doc, _ in self.fitz_docs: doc.close()
         self.fitz_docs, self.page_map, self.toc_data = [], [], []
 
-        # Save uploaded bytes to temp file for ebooklib
+        # Save uploaded bytes to temp file
         epub_temp_path = os.path.join(self.temp_dir.name, "input.epub")
         with open(epub_temp_path, "wb") as f:
             f.write(epub_bytes)
@@ -162,11 +167,10 @@ class EpubProcessor:
             font_face_rule = ""
             font_family_val = "serif"
 
-        # --- CHANGED: Injected @page size into CSS ---
         custom_css = f"""
         <style>
             {font_face_rule}
-            
+
             @page {{ 
                 size: {self.screen_width}pt {self.screen_height}pt; 
                 margin: 0; 
@@ -188,7 +192,7 @@ class EpubProcessor:
                 width: 100% !important;
                 height: 100% !important;
             }}
-            img {{ max-width: 95% !important; height: auto !important; display: block; margin: 50px auto !important; }}
+            img {{ max-width: 95% !important; height: auto !important; display: block; margin: 20px auto !important; }}
             h1, h2, h3 {{ 
                 text-align: center !important; 
                 margin-top: 1em; 
@@ -212,11 +216,13 @@ class EpubProcessor:
         temp_chapter_starts = []
         running_page_count = 0
 
-        # Create a progress bar in Streamlit
+        # Progress reporting for Streamlit
+        status_text = st.empty()
         progress_bar = st.progress(0)
-        
+
         self.toc_data = []
         for idx, item in enumerate(items):
+            status_text.text(f"Processing chapter {idx + 1}/{len(items)}...")
             progress_bar.progress(int((idx / len(items)) * 90))
 
             item_name = item.get_name()
@@ -242,30 +248,27 @@ class EpubProcessor:
             body_content = "".join([str(x) for x in soup.body.contents]) if soup.body else str(soup)
             final_html = f"<html lang='{book_lang}'><head><style>{original_css}</style>{custom_css}</head><body>{body_content}</body></html>"
 
-            # Use unique temp filename
             temp_html_path = os.path.join(self.temp_dir.name, f"render_{idx}.html")
             with open(temp_html_path, "w", encoding="utf-8") as f:
                 f.write(final_html)
 
             doc = fitz.open(temp_html_path)
 
-            # --- CHANGED: FORCE REFLOW (The Fix) ---
-            # This ensures PyMuPDF recalculates the layout for the new dimensions
             rect = fitz.Rect(0, 0, self.screen_width, self.screen_height)
             doc.layout(rect=rect)
-            # ---------------------------------------
 
             self.fitz_docs.append((doc, has_image))
             for i in range(len(doc)): self.page_map.append((len(self.fitz_docs) - 1, i))
             running_page_count += len(doc)
 
         if add_toc:
-            # Recalculate TOC sizes based on new width/height
+            # Dynamic calculation for TOC items per page based on font size
             toc_header_space = 100 + self.top_padding
-            toc_row_height = 35
+            # Row height is font_size * line_height + padding
+            self.toc_row_height = int(self.font_size * self.line_height * 1.2)
             available_h = self.screen_height - self.bottom_padding - toc_header_space
 
-            self.toc_items_per_page = max(1, int(available_h // toc_row_height))
+            self.toc_items_per_page = max(1, int(available_h // self.toc_row_height))
             num_toc_pages = (len(self.toc_data) + self.toc_items_per_page - 1) // self.toc_items_per_page
 
             self.toc_data_final = [(t, temp_chapter_starts[i] + num_toc_pages + 1) for i, t in enumerate(self.toc_data)]
@@ -275,20 +278,33 @@ class EpubProcessor:
             self.toc_pages_images = []
 
         self.total_pages = len(self.toc_pages_images) + len(self.page_map)
-        progress_bar.progress(100)
+
+        status_text.empty()
+        progress_bar.empty()
+
         self.is_ready = True
         return True
 
     def _get_ui_font(self, size):
-        # Fallback for web
         if self.font_path and os.path.exists(self.font_path):
-             return get_pil_font(self.font_path, size)
+            return get_pil_font(self.font_path, int(size))
+        # Fallback to default if no custom font
         return ImageFont.load_default()
 
     def _render_toc_pages(self, toc_entries):
         pages = []
-        font_main = self._get_ui_font(20)
-        font_header = self._get_ui_font(24)
+
+        # Use dynamic sizes based on config
+        main_size = self.font_size
+        header_size = int(self.font_size * 1.2)
+
+        font_main = self._get_ui_font(main_size)
+        font_header = self._get_ui_font(header_size)
+
+        # Faux bold logic: if weight > 500, use stroke_width=1
+        base_stroke = 1 if self.font_weight > 500 else 0
+        header_stroke = 1 if self.font_weight > 400 else 0
+
         left_margin, right_margin, column_gap = 40, 40, 20
         limit = self.toc_items_per_page
 
@@ -300,36 +316,68 @@ class EpubProcessor:
             header_text = "TABLE OF CONTENTS"
             header_w = font_header.getlength(header_text)
             header_y = 40 + self.top_padding
-            draw.text(((self.screen_width - header_w) // 2, header_y), header_text, font=font_header, fill=0)
+            draw.text(
+                ((self.screen_width - header_w) // 2, header_y),
+                header_text,
+                font=font_header,
+                fill=0,
+                stroke_width=header_stroke
+            )
 
-            line_y = header_y + 35
+            line_y = header_y + int(header_size * 1.5)
             draw.line((left_margin, line_y, self.screen_width - right_margin, line_y), fill=0)
 
-            y = line_y + 25
+            y = line_y + int(main_size * 1.2)
+
             for title, pg_num in chunk:
                 pg_str = str(pg_num)
                 pg_w = font_main.getlength(pg_str)
                 max_title_w = self.screen_width - left_margin - right_margin - pg_w - column_gap
                 display_title = title
-                
-                # Check text length safely
+
+                # Truncate title if too long
                 try:
                     if font_main.getlength(display_title) > max_title_w:
                         while font_main.getlength(display_title + "...") > max_title_w and len(display_title) > 0:
                             display_title = display_title[:-1]
                         display_title += "..."
-                except: pass
+                except:
+                    pass
 
-                draw.text((left_margin, y), display_title, font=font_main, fill=0)
+                draw.text(
+                    (left_margin, y),
+                    display_title,
+                    font=font_main,
+                    fill=0,
+                    stroke_width=base_stroke
+                )
+
                 title_end_x = left_margin + font_main.getlength(display_title) + 5
                 dots_end_x = self.screen_width - right_margin - pg_w - 10
+
+                # Draw dots
                 if dots_end_x > title_end_x:
                     try:
-                        dots_text = "." * int((dots_end_x - title_end_x) / font_main.getlength("."))
-                        draw.text((title_end_x, y), dots_text, font=font_main, fill=0)
-                    except: pass
-                draw.text((self.screen_width - right_margin - pg_w, y), pg_str, font=font_main, fill=0)
-                y += 35
+                        dot_char = "."
+                        dot_w = font_main.getlength(dot_char)
+                        if dot_w > 0:
+                            dots_count = int((dots_end_x - title_end_x) / dot_w)
+                            dots_text = dot_char * dots_count
+                            draw.text((title_end_x, y), dots_text, font=font_main, fill=0)
+                    except:
+                        pass
+
+                # Draw page number
+                draw.text(
+                    (self.screen_width - right_margin - pg_w, y),
+                    pg_str,
+                    font=font_main,
+                    fill=0,
+                    stroke_width=base_stroke
+                )
+
+                y += self.toc_row_height
+
             pages.append(img)
         return pages
 
@@ -351,8 +399,7 @@ class EpubProcessor:
             pix = page.get_pixmap(matrix=mat, alpha=False)
 
             img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            
-            # --- CHANGED: Use dynamic screen width ---
+
             img_content = img_content.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert("L")
 
             img = Image.new("RGB", (self.screen_width, self.screen_height), (255, 255, 255))
@@ -398,195 +445,218 @@ class EpubProcessor:
         if current_title:
             try:
                 draw.text((100, footer_y), f"| {current_title}"[:35], font=font_ui, fill=(0, 0, 0))
-            except: pass
+            except:
+                pass
 
         return img
 
     def get_xtc_bytes(self):
-        # Returns bytes buffer instead of writing to file
         if not self.is_ready: return None
         blob, idx = bytearray(), bytearray()
         data_off = 56 + (16 * self.total_pages)
-        
-        # Simple progress tracking for export
+
         prog_text = st.empty()
-        
+
         for i in range(self.total_pages):
-            if i % 10 == 0: prog_text.text(f"Generating page {i+1}/{self.total_pages}...")
+            if i % 10 == 0: prog_text.text(f"Exporting page {i + 1}/{self.total_pages}...")
             img = self.render_page(i).convert("L").point(lambda p: 255 if p > 128 else 0, mode='1')
             w, h = img.size
             xtg = struct.pack("<IHHBBIQ", 0x00475458, w, h, 0, 0, ((w + 7) // 8) * h, 0) + img.tobytes()
             idx.extend(struct.pack("<QIHH", data_off + len(blob), len(xtg), w, h))
             blob.extend(xtg)
-            
-        header = struct.pack("<IHHBBBBIQQQQQ", 0x00435458, 0x0100, self.total_pages, 0, 0, 0, 0, 0, 0, 56, data_off, 0, 0)
+
+        header = struct.pack("<IHHBBBBIQQQQQ", 0x00435458, 0x0100, self.total_pages, 0, 0, 0, 0, 0, 0, 56, data_off, 0,
+                             0)
         prog_text.empty()
-        
+
         return io.BytesIO(header + idx + blob)
+
 
 # --- STREAMLIT APP ---
 
 def main():
-    st.set_page_config(page_title="EPUB to XTC Web Converter", layout="wide")
+    st.set_page_config(page_title="EPUB to XTC Live", layout="wide")
+
+    # CSS to increase Sidebar Width and hide default headers
     st.markdown("""
     <style>
-    /* --- 1. CLEAN UP HEADERS --- */
-    [data-testid="stHeader"] {
-        background-color: transparent !important;
-    }
-
-    /* --- 2. LIGHT MODE (Modern & Clean) --- */
-    @media (prefers-color-scheme: light) {
-        /* Main Area: Very soft off-white/blue-ish gray (Professional look) */
-        .stApp, [data-testid="stAppViewContainer"] {
-            background-color: #f0f2f6 !important;
-        }
-        
-        /* Sidebar: Pure white for contrast */
-        [data-testid="stSidebar"] {
-            background-color: #ffffff !important;
-            border-right: 1px solid #e0e0e0;
-        }
-        
-        /* Text: Dark slate (easier on eyes than pure black) */
-        h1, h2, h3, p, li, span, .stMarkdown, .stText, label, .stButton {
-            color: #31333F !important;
-        }
-    }
-
-    /* --- 3. DARK MODE (Easy on eyes) --- */
-    @media (prefers-color-scheme: dark) {
-        /* Main Area: Deep Charcoal */
-        .stApp, [data-testid="stAppViewContainer"] {
-            background-color: #0e1117 !important;
-        }
-        
-        /* Sidebar: Slightly lighter dark for separation */
-        [data-testid="stSidebar"] {
-            background-color: #262730 !important;
-            border-right: 1px solid #444;
-        }
-        
-        /* Text: Off-white */
-        h1, h2, h3, p, li, span, .stMarkdown, .stText, label, .stButton {
-            color: #fafafa !important;
-        }
-    }
+        section[data-testid="stSidebar"] { width: 400px !important; }
+        .block-container { padding-top: 1rem; padding-bottom: 1rem; }
+        header[data-testid="stHeader"] { height: 0; visibility: hidden; }
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("EPUB to XTC Converter (Web)")
-
-    # Sidebar for inputs
-    with st.sidebar:
-        st.header("Settings")
-        uploaded_file = st.file_uploader("Upload EPUB", type=["epub"])
-        
-        uploaded_font = st.file_uploader("Upload Custom Font (TTF)", type=["ttf"])
-        
-        # --- CHANGED: Added Orientation Selector ---
-        orientation = st.selectbox("Orientation", ["Portrait", "Landscape"])
-        
-        # Checkbox for TOC
-        use_toc = st.checkbox("Generate TOC Pages", value=True)
-        text_align = st.selectbox("Text Alignment", ["justify", "left"])
-        
-        # Sliders
-        font_size = st.slider("Font Size", 12, 36, DEFAULT_FONT_SIZE)
-        font_weight = st.slider("Font Weight", 100, 900, DEFAULT_FONT_WEIGHT, step=100)
-        line_height = st.slider("Line Height", 1.0, 2.5, DEFAULT_LINE_HEIGHT)
-        margin = st.slider("Margin", 0, 100, DEFAULT_MARGIN)
-        top_pad = st.slider("Top Padding", 0, 100, DEFAULT_TOP_PADDING)
-        bot_pad = st.slider("Bottom Padding", 0, 100, DEFAULT_BOTTOM_PADDING)
-        
-        btn_process = st.button("Process Book", type="primary")
-
     # Initialize Session State
     if 'processor' not in st.session_state:
-        st.session_state.processor = None
+        st.session_state.processor = EpubProcessor()
     if 'current_page' not in st.session_state:
         st.session_state.current_page = 0
+    if 'last_config' not in st.session_state:
+        st.session_state.last_config = {}
 
-    # Logic
-    if btn_process and uploaded_file:
-        proc = EpubProcessor()
-        
-        # Handle Font Upload
-        font_path = ""
-        if uploaded_font:
-            # Save font to temp file so PIL/CSS can read it
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".ttf")
-            tfile.write(uploaded_font.read())
-            font_path = tfile.name
-        
-        with st.spinner("Processing EPUB..."):
-            success = proc.load_and_layout(
-                uploaded_file.getvalue(),
-                font_path,
-                font_size, margin, line_height, font_weight,
-                bot_pad, top_pad, text_align, 
-                # --- CHANGED: Passing orientation ---
-                orientation, 
-                use_toc
-            )
-            
-            if success:
-                st.session_state.processor = proc
-                st.session_state.current_page = 0
-                st.success("Processing Complete!")
-            else:
-                st.error("Failed to process EPUB.")
+    st.markdown(
+        "<h3 style='margin-bottom: 0.5rem; text-align: center;'>📘 EPUB → XTC Converter</h3>",
+        unsafe_allow_html=True
+    )
 
-    # Preview and Export Area
-    if st.session_state.processor and st.session_state.processor.is_ready:
-        col1, col2 = st.columns([1, 1])
-        
-        with col1:
-            st.subheader("Preview")
-            
-            # Navigation
-            c_prev, c_page, c_next = st.columns([1, 2, 1])
-            with c_prev:
-                if st.button("Previous"):
-                    st.session_state.current_page = max(0, st.session_state.current_page - 1)
-            with c_next:
-                if st.button("Next"):
-                    st.session_state.current_page = min(st.session_state.processor.total_pages - 1, st.session_state.current_page + 1)
-            with c_page:
-                st.write(f"Page {st.session_state.current_page + 1} / {st.session_state.processor.total_pages}")
-            
-            # Render Image
-            img = st.session_state.processor.render_page(st.session_state.current_page)
-            
-            # Create a copy for the preview so we don't mess up the actual file export
-            preview_img = img.copy()
-            
-            # Draw a black border directly onto the pixels
-            draw = ImageDraw.Draw(preview_img)
-            width, height = preview_img.size
-            # Draw rectangle: (x0, y0, x1, y1), outline=color, width=thickness
-            draw.rectangle([(0, 0), (width - 1, height - 1)], outline="black", width=4)
-
-            # --- CHANGED: Removed hardcoded width=400 to allow Streamlit to size landscape images better ---
-            st.image(preview_img, caption=f"Page {st.session_state.current_page + 1}", use_column_width=False)
-
-        with col2:
-            st.subheader("Export")
-            st.write("Click below to generate and download the .xtc file.")
-            
-            if st.button("Generate XTC File"):
-                with st.spinner("Compiling binary XTC file..."):
+    # --- SIDEBAR: CONTROLS ---
+    with st.sidebar:
+        # 1. EXPORT SECTION
+        if st.session_state.processor.is_ready:
+            st.success("✅ Book Ready for Export")
+            if st.button("Download XTC File", type="primary", use_container_width=True):
+                with st.spinner("Generating binary..."):
                     xtc_data = st.session_state.processor.get_xtc_bytes()
-                    
                     st.download_button(
-                        label="Download .xtc file",
+                        label="Click here to Save",
                         data=xtc_data,
-                        file_name="converted_book.xtc",
+                        file_name="book.xtc",
                         mime="application/octet-stream"
                     )
+            st.divider()
 
-    elif not uploaded_file:
-        st.info("Upload an EPUB file in the sidebar to begin.")
+        # 2. INPUT SECTION
+        st.header("1. Input Files")
+        uploaded_file = st.file_uploader("Upload EPUB", type=["epub"])
+        uploaded_font = st.file_uploader("Custom Font (TTF)", type=["ttf"])
+
+        st.divider()
+
+        # 3. SETTINGS GRID
+        st.header("2. Layout & Typography")
+
+        current_config = {}
+
+        r1_c1, r1_c2 = st.columns(2)
+        with r1_c1:
+            current_config['orientation'] = st.selectbox("Orientation", ["Portrait", "Landscape"])
+        with r1_c2:
+            current_config['align'] = st.selectbox("Alignment", ["justify", "left"])
+
+        current_config['use_toc'] = st.checkbox("Generate Table of Contents", value=True)
+
+        st.subheader("Text Settings")
+        r2_c1, r2_c2 = st.columns(2)
+        with r2_c1:
+            current_config['font_size'] = st.number_input("Font Size", 10, 50, DEFAULT_FONT_SIZE)
+        with r2_c2:
+            current_config['font_weight'] = st.number_input("Weight (100-900)", 100, 900, DEFAULT_FONT_WEIGHT, step=100)
+
+        r3_c1, r3_c2 = st.columns(2)
+        with r3_c1:
+            current_config['line_height'] = st.number_input("Line Height", 1.0, 3.0, DEFAULT_LINE_HEIGHT, step=0.1)
+        with r3_c2:
+            current_config['margin'] = st.number_input("Side Margin", 0, 100, DEFAULT_MARGIN)
+
+        st.subheader("Vertical Spacing")
+        r4_c1, r4_c2 = st.columns(2)
+        with r4_c1:
+            current_config['top_pad'] = st.number_input("Top Pad", 0, 100, DEFAULT_TOP_PADDING)
+        with r4_c2:
+            current_config['bot_pad'] = st.number_input("Bottom Pad", 0, 100, DEFAULT_BOTTOM_PADDING)
+
+        st.divider()
+        st.header("3. View")
+        preview_width = st.slider("Preview Zoom", 200, 800, 350)
+
+    # --- LOGIC CORE ---
+
+    if uploaded_file:
+        file_signature = uploaded_file.name + str(uploaded_file.size)
+        current_config['file_sig'] = file_signature
+
+        # Handle Font Path
+        font_path = ""
+        if uploaded_font:
+            # We use a context manager or explicitly close to ensure the lock is released
+            # so PIL can read it immediately after.
+            try:
+                tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".ttf")
+                tfile.write(uploaded_font.getvalue())
+                font_path = tfile.name
+                tfile.close()  # Explicitly close to release lock
+                current_config['font_sig'] = uploaded_font.name
+            except Exception as e:
+                st.error(f"Error handling font file: {e}")
+
+        # Check if we need to run the heavy processing
+        if current_config != st.session_state.last_config or not st.session_state.processor.is_ready:
+
+            relative_pos = 0.0
+            if st.session_state.processor.is_ready and st.session_state.processor.total_pages > 0:
+                relative_pos = st.session_state.current_page / st.session_state.processor.total_pages
+
+            with st.spinner("Rendering layout..."):
+                success = st.session_state.processor.load_and_layout(
+                    uploaded_file.getvalue(),
+                    font_path,
+                    current_config['font_size'],
+                    current_config['margin'],
+                    current_config['line_height'],
+                    current_config['font_weight'],
+                    current_config['bot_pad'],
+                    current_config['top_pad'],
+                    current_config['align'],
+                    current_config['orientation'],
+                    current_config['use_toc']
+                )
+
+                if success:
+                    st.session_state.last_config = current_config
+                    new_total = st.session_state.processor.total_pages
+                    st.session_state.current_page = int(relative_pos * new_total)
+                    st.session_state.current_page = min(max(0, st.session_state.current_page), new_total - 1)
+                    st.rerun()
+
+    # --- DISPLAY AREA ---
+
+    if st.session_state.processor.is_ready:
+        nav_cols = st.columns([1, 3, 1])
+
+        with nav_cols[0]:
+            if st.button("⬅ Previous", use_container_width=True):
+                st.session_state.current_page = max(0, st.session_state.current_page - 1)
+
+        with nav_cols[1]:
+            st.markdown(
+                f"""
+                <div style="text-align:center; font-size:1.1rem; margin-bottom: 0.5rem; color: #444;">
+                    Page <b>{st.session_state.current_page + 1}</b> / {st.session_state.processor.total_pages}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
+
+        with nav_cols[2]:
+            if st.button("Next ➡", use_container_width=True):
+                st.session_state.current_page = min(
+                    st.session_state.processor.total_pages - 1,
+                    st.session_state.current_page + 1
+                )
+
+        img = st.session_state.processor.render_page(st.session_state.current_page)
+
+        preview_img = img.copy()
+        draw = ImageDraw.Draw(preview_img)
+        w, h = preview_img.size
+        draw.rectangle([(0, 0), (w - 1, h - 1)], outline="black", width=2)
+
+        with io.BytesIO() as buffer:
+            preview_img.save(buffer, format="PNG")
+            img_b64 = base64.b64encode(buffer.getvalue()).decode()
+
+        st.markdown(
+            f"""
+            <div style="display: flex; justify-content: center; margin-top: 15px; margin-bottom: 50px;">
+                <img src="data:image/png;base64,{img_b64}" width="{preview_width}" style="max-width: 100%; box-shadow: 0px 4px 15px rgba(0,0,0,0.15);">
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+
+    else:
+        st.info("👈 Please upload an EPUB file in the sidebar to begin.")
+
 
 if __name__ == "__main__":
     main()
