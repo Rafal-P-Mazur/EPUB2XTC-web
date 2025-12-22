@@ -428,8 +428,7 @@ class EpubProcessor:
 
 def main():
     st.set_page_config(page_title="EPUB to XTC Web Converter", layout="wide")
-    
-   st.markdown("""
+    st.markdown("""
     <style>
     /* --- 1. CLEAN UP HEADERS --- */
     [data-testid="stHeader"] {
