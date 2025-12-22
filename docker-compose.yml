@@ -1,0 +1,7 @@
+services:
+  epub2xtc-web:
+    build: .
+    container_name: epub2xtc-web
+    ports:
+      - "8501:8501"
+    restart: unless-stopped

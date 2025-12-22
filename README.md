@@ -32,15 +32,19 @@ A web-based tool designed to convert standard `.epub` files into the `.xtc` bina
     * Enter a specific number in the **"Jump to page"** input box below the preview to skip directly to that page.
 6.  **Download:** Once satisfied, click the **Download XTC** button in the sidebar to save the final binary file.
 
-## 📦 Dependencies
+   ```
+   $ streamlit run streamlit_app.py
+   ```
 
-* `streamlit` (Web Interface)
-* `PyMuPDF` (Rendering)
-* `Pillow` (Image Processing)
-* `EbookLib` & `BeautifulSoup4` (Parsing)
-* `Pyphen` (Hyphenation)
+## Running with Docker (Streamlit Web App)
 
----
+This repository can be run locally using Docker and Docker Compose, providing the same Streamlit web interface as the public demo.
 
-## 📄 License
-MIT License
+### Build and run
+
+Clone the repository and run:
+
+```bash
+docker compose build --no-cache
+docker compose up -d && docker-compose logs -f
+```
