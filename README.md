@@ -17,3 +17,16 @@ A simple Streamlit app template for you to modify!
    ```
    $ streamlit run streamlit_app.py
    ```
+
+## Running with Docker (Streamlit Web App)
+
+This repository can be run locally using Docker and Docker Compose, providing the same Streamlit web interface as the public demo.
+
+### Build and run
+
+Clone the repository and run:
+
+```bash
+docker compose build --no-cache
+docker compose up -d && docker-compose logs -f
+```
