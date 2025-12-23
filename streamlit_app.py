@@ -11,6 +11,7 @@ import base64
 import re
 import tempfile
 import io
+import json
 
 # --- CONFIGURATION DEFAULTS ---
 DEFAULT_SCREEN_WIDTH = 480
@@ -20,7 +21,7 @@ DEFAULT_FONT_SIZE = 22
 DEFAULT_MARGIN = 20
 DEFAULT_LINE_HEIGHT = 1.4
 DEFAULT_FONT_WEIGHT = 400
-DEFAULT_BOTTOM_PADDING = 15
+DEFAULT_BOTTOM_PADDING = 45
 DEFAULT_TOP_PADDING = 15
 
 
@@ -126,6 +127,16 @@ class EpubProcessor:
         self.is_ready = False
         self.temp_dir = tempfile.TemporaryDirectory()
 
+        # Footer Defaults
+        self.footer_visible = True
+        self.footer_font_size = 16
+        self.footer_show_progress = True
+        self.footer_show_pagenum = True
+        self.footer_show_title = True
+        self.footer_text_pos = "Text Above Bar"
+        self.footer_bar_height = 4
+        self.footer_bottom_margin = 10
+
     # --- STEP 1: PARSE STRUCTURE (FAST) ---
     def parse_structure(self, epub_bytes):
         self.raw_chapters = []
@@ -174,7 +185,7 @@ class EpubProcessor:
 
     # --- STEP 2: RENDER (SLOW) ---
     def render_chapters(self, selected_indices_set, font_path, font_size, margin, line_height, font_weight,
-                        bottom_padding, top_padding, text_align, orientation, add_toc):
+                        bottom_padding, top_padding, text_align, orientation, add_toc, footer_settings=None):
 
         self.font_path = font_path
         self.font_size = int(font_size)
@@ -184,6 +195,17 @@ class EpubProcessor:
         self.bottom_padding = bottom_padding
         self.top_padding = top_padding
         self.text_align = text_align
+
+        # Apply Footer Settings
+        if footer_settings:
+            self.footer_visible = footer_settings.get("footer_visible", True)
+            self.footer_font_size = footer_settings.get("footer_font_size", 16)
+            self.footer_show_progress = footer_settings.get("footer_show_progress", True)
+            self.footer_show_pagenum = footer_settings.get("footer_show_pagenum", True)
+            self.footer_show_title = footer_settings.get("footer_show_title", True)
+            self.footer_text_pos = footer_settings.get("footer_text_pos", "Text Above Bar")
+            self.footer_bar_height = footer_settings.get("footer_bar_height", 4)
+            self.footer_bottom_margin = footer_settings.get("footer_bottom_margin", 10)
 
         if orientation == "Landscape":
             self.screen_width = DEFAULT_SCREEN_HEIGHT
@@ -379,39 +401,97 @@ class EpubProcessor:
                 img = ImageEnhance.Contrast(img).enhance(2.0).point(lambda p: 255 if p > 140 else 0, mode='1')
             img = img.convert("RGB")
 
-        draw = ImageDraw.Draw(img)
-        font_ui = self._get_ui_font(16)
-        page_num_disp = global_page_index + 1
-        current_title = ""
-        chapter_pages = [item[1] for item in self.toc_data_final]
+        # --- DYNAMIC FOOTER RENDERING ---
+        if self.footer_visible:
+            draw = ImageDraw.Draw(img)
 
-        for title, start_pg in reversed(self.toc_data_final):
-            if page_num_disp >= start_pg:
-                current_title = title
-                break
+            # 1. Clean background for footer area based on user margin + buffer
+            clean_start_y = self.screen_height - self.bottom_padding
+            draw.rectangle([0, clean_start_y, self.screen_width, self.screen_height], fill=(255, 255, 255))
 
-        bar_height = 4
-        bar_y_top = self.screen_height - 20
-        footer_y = self.screen_height - 45
+            # 2. Calculate Layout
+            font_ui = self._get_ui_font(self.footer_font_size)
+            text_height_px = int(self.footer_font_size * 1.3)
+            bar_thickness = self.footer_bar_height if self.footer_show_progress else 0
 
-        draw.rectangle([10, bar_y_top, self.screen_width - 10, bar_y_top + bar_height], fill=(255, 255, 255),
-                       outline=(0, 0, 0))
+            element_gap = 5
 
-        for cp in chapter_pages:
-            if self.total_pages > 0:
-                mx = int(((cp - 1) / self.total_pages) * (self.screen_width - 20)) + 10
-                draw.line([mx, bar_y_top - 4, mx, bar_y_top], fill=(0, 0, 0), width=1)
+            # Position Reference: footer_bottom_margin is distance from BOTTOM of screen
+            base_y = self.screen_height - self.footer_bottom_margin
 
-        if self.total_pages > 0:
-            bw = int((page_num_disp / self.total_pages) * (self.screen_width - 20))
-            draw.rectangle([10, bar_y_top, 10 + bw, bar_y_top + bar_height], fill=(0, 0, 0))
+            bar_y = 0
+            text_y = 0
 
-        draw.text((15, footer_y), f"{page_num_disp}/{self.total_pages}", font=font_ui, fill=(0, 0, 0))
-        if current_title:
-            try:
-                draw.text((100, footer_y), f"| {current_title}"[:35], font=font_ui, fill=(0, 0, 0))
-            except:
-                pass
+            if self.footer_text_pos == "Text Above Bar":
+                # Layout from bottom up: Margin -> Bar -> Gap -> Text
+                if self.footer_show_progress:
+                    bar_y = base_y - bar_thickness
+                    text_ref = bar_y - element_gap
+                else:
+                    text_ref = base_y
+
+                text_y = text_ref - text_height_px + 3  # +3 adjustment for font baseline
+
+            else:  # "Text Below Bar"
+                # Layout from bottom up: Margin -> Text -> Gap -> Bar
+                has_text = self.footer_show_pagenum or self.footer_show_title
+                if has_text:
+                    text_y = base_y - text_height_px
+                    bar_ref = text_y - element_gap
+                else:
+                    bar_ref = base_y
+
+                bar_y = bar_ref - bar_thickness
+
+            # 3. Draw Progress Bar
+            if self.footer_show_progress:
+                draw.rectangle([10, bar_y, self.screen_width - 10, bar_y + bar_thickness], fill=(255, 255, 255),
+                               outline=(0, 0, 0))
+
+                # Chapters ticks
+                chapter_pages = [item[1] for item in self.toc_data_final]
+                for cp in chapter_pages:
+                    if self.total_pages > 0:
+                        mx = int(((cp - 1) / self.total_pages) * (self.screen_width - 20)) + 10
+                        draw.line([mx, bar_y - 1, mx, bar_y + bar_thickness + 1], fill=(0, 0, 0), width=1)
+
+                # Fill progress
+                page_num_disp = global_page_index + 1
+                if self.total_pages > 0:
+                    bw = int((page_num_disp / self.total_pages) * (self.screen_width - 20))
+                    draw.rectangle([10, bar_y, 10 + bw, bar_y + bar_thickness], fill=(0, 0, 0))
+
+            # 4. Draw Text Elements
+            has_text = self.footer_show_pagenum or self.footer_show_title
+            if has_text:
+                page_num_disp = global_page_index + 1
+                current_title = ""
+                for title, start_pg in reversed(self.toc_data_final):
+                    if page_num_disp >= start_pg:
+                        current_title = title
+                        break
+
+                cursor_x = 15
+
+                # Draw Page Num
+                if self.footer_show_pagenum:
+                    pg_text = f"{page_num_disp}/{self.total_pages}"
+                    draw.text((cursor_x, text_y), pg_text, font=font_ui, fill=(0, 0, 0))
+                    cursor_x += font_ui.getlength(pg_text) + 15
+
+                    if self.footer_show_title and current_title:
+                        draw.text((cursor_x - 10, text_y), "|", font=font_ui, fill=(0, 0, 0))
+
+                # Draw Title
+                if self.footer_show_title and current_title:
+                    available_width = self.screen_width - cursor_x - 10
+                    display_title = current_title
+                    if font_ui.getlength(display_title) > available_width:
+                        while font_ui.getlength(display_title + "...") > available_width and len(display_title) > 0:
+                            display_title = display_title[:-1]
+                        display_title += "..."
+                    draw.text((cursor_x, text_y), display_title, font=font_ui, fill=(0, 0, 0))
+
         return img
 
     def get_xtc_bytes(self):
@@ -485,6 +565,69 @@ def main():
                     else:
                         st.error(msg)
 
+        # --- PRESET MANAGEMENT (NEW) ---
+        st.divider()
+        with st.expander("Presets (Save/Load)", expanded=False):
+            # Uploader
+            uploaded_preset = st.file_uploader("Load Preset (JSON)", type=["json"])
+            if uploaded_preset:
+                try:
+                    loaded_data = json.load(uploaded_preset)
+                    # Update session state keys with loaded data
+                    # Map config keys to widget keys
+                    key_map = {
+                        'orientation': 'orientation', 'align': 'align', 'use_toc': 'use_toc',
+                        'font_size': 'font_size', 'font_weight': 'font_weight',
+                        'line_height': 'line_height', 'margin': 'margin',
+                        'top_pad': 'top_pad', 'bot_pad': 'bot_pad',
+                        'footer_visible': 'footer_visible',
+                        'footer_show_progress': 'footer_show_progress',
+                        'footer_show_pagenum': 'footer_show_pagenum',
+                        'footer_show_title': 'footer_show_title',
+                        'footer_text_pos': 'footer_text_pos',
+                        'footer_font_size': 'footer_font_size',
+                        'footer_bar_height': 'footer_bar_height',
+                        'footer_bottom_margin': 'footer_bottom_margin'
+                    }
+
+                    for json_key, ss_key in key_map.items():
+                        if json_key in loaded_data:
+                            st.session_state[ss_key] = loaded_data[json_key]
+
+                    st.success("Preset loaded! (UI updated)")
+                except Exception as e:
+                    st.error(f"Failed to load preset: {e}")
+
+            # Downloader (Needs current config from session state)
+            # We construct the dict from session_state values if they exist, else defaults
+            current_ss_config = {
+                'orientation': st.session_state.get('orientation', "Portrait"),
+                'align': st.session_state.get('align', "justify"),
+                'use_toc': st.session_state.get('use_toc', True),
+                'font_size': st.session_state.get('font_size', DEFAULT_FONT_SIZE),
+                'font_weight': st.session_state.get('font_weight', DEFAULT_FONT_WEIGHT),
+                'line_height': st.session_state.get('line_height', DEFAULT_LINE_HEIGHT),
+                'margin': st.session_state.get('margin', DEFAULT_MARGIN),
+                'top_pad': st.session_state.get('top_pad', DEFAULT_TOP_PADDING),
+                'bot_pad': st.session_state.get('bot_pad', DEFAULT_BOTTOM_PADDING),
+                'footer_visible': st.session_state.get('footer_visible', True),
+                'footer_show_progress': st.session_state.get('footer_show_progress', True),
+                'footer_show_pagenum': st.session_state.get('footer_show_pagenum', True),
+                'footer_show_title': st.session_state.get('footer_show_title', True),
+                'footer_text_pos': st.session_state.get('footer_text_pos', "Text Above Bar"),
+                'footer_font_size': st.session_state.get('footer_font_size', 16),
+                'footer_bar_height': st.session_state.get('footer_bar_height', 4),
+                'footer_bottom_margin': st.session_state.get('footer_bottom_margin', 10)
+            }
+
+            json_str = json.dumps(current_ss_config, indent=4)
+            st.download_button(
+                label="Download Current Preset",
+                data=json_str,
+                file_name="my_preset.json",
+                mime="application/json"
+            )
+
         st.divider()
 
         if st.session_state.processor.is_parsed:
@@ -499,31 +642,69 @@ def main():
         current_config = {}
         r1_c1, r1_c2 = st.columns(2)
         with r1_c1:
-            current_config['orientation'] = st.selectbox("Orientation", ["Portrait", "Landscape"])
+            current_config['orientation'] = st.selectbox("Orientation", ["Portrait", "Landscape"], key="orientation")
         with r1_c2:
-            current_config['align'] = st.selectbox("Alignment", ["justify", "left"])
+            current_config['align'] = st.selectbox("Alignment", ["justify", "left"], key="align")
 
-        current_config['use_toc'] = st.checkbox("Generate TOC Pages", value=True)
+        current_config['use_toc'] = st.checkbox("Generate TOC Pages", value=True, key="use_toc")
 
         st.subheader("Typography")
         r2_c1, r2_c2 = st.columns(2)
         with r2_c1:
-            current_config['font_size'] = st.number_input("Font Size", 10, 50, DEFAULT_FONT_SIZE)
+            current_config['font_size'] = st.number_input("Font Size", 10, 50, DEFAULT_FONT_SIZE, key="font_size")
         with r2_c2:
-            current_config['font_weight'] = st.number_input("Weight", 100, 900, DEFAULT_FONT_WEIGHT, step=100)
+            current_config['font_weight'] = st.number_input("Weight", 100, 900, DEFAULT_FONT_WEIGHT, step=100,
+                                                            key="font_weight")
 
         r3_c1, r3_c2 = st.columns(2)
         with r3_c1:
-            current_config['line_height'] = st.number_input("Line Height", 1.0, 3.0, DEFAULT_LINE_HEIGHT, step=0.1)
+            current_config['line_height'] = st.number_input("Line Height", 1.0, 3.0, DEFAULT_LINE_HEIGHT, step=0.1,
+                                                            key="line_height")
         with r3_c2:
-            current_config['margin'] = st.number_input("Margin", 0, 100, DEFAULT_MARGIN)
+            current_config['margin'] = st.number_input("Margin", 0, 100, DEFAULT_MARGIN, key="margin")
 
         st.subheader("Spacing")
         r4_c1, r4_c2 = st.columns(2)
         with r4_c1:
-            current_config['top_pad'] = st.number_input("Top Pad", 0, 100, DEFAULT_TOP_PADDING)
+            current_config['top_pad'] = st.number_input("Top Padding", 0, 100, DEFAULT_TOP_PADDING, key="top_pad")
         with r4_c2:
-            current_config['bot_pad'] = st.number_input("Bot Pad", 0, 100, DEFAULT_BOTTOM_PADDING)
+            current_config['bot_pad'] = st.number_input("Bottom Padding", 0, 100, DEFAULT_BOTTOM_PADDING, key="bot_pad")
+
+        # --- FOOTER SETTINGS (NEW) ---
+        st.divider()
+        st.subheader("Footer Settings")
+        current_config['footer_visible'] = st.checkbox("Show Footer Area", value=True, key="footer_visible")
+
+        if current_config['footer_visible']:
+            f_col1, f_col2 = st.columns(2)
+
+            with f_col1:
+                st.caption("Content")
+                current_config['footer_show_progress'] = st.checkbox("Progress Bar", value=True,
+                                                                     key="footer_show_progress")
+                current_config['footer_show_pagenum'] = st.checkbox("Page Numbers", value=True,
+                                                                    key="footer_show_pagenum")
+                current_config['footer_show_title'] = st.checkbox("Chapter Title", value=True, key="footer_show_title")
+                current_config['footer_text_pos'] = st.selectbox("Text Position", ["Text Above Bar", "Text Below Bar"],
+                                                                 key="footer_text_pos")
+
+            with f_col2:
+                st.caption("Style")
+                current_config['footer_font_size'] = st.number_input("Text Size", 10, 24, 16, key="footer_font_size")
+                current_config['footer_bar_height'] = st.number_input("Bar Thickness", 1, 10, 4,
+                                                                      key="footer_bar_height")
+                # LABEL RENAMED HERE
+                current_config['footer_bottom_margin'] = st.number_input("Footer Position", 0, 100, 10,
+                                                                         key="footer_bottom_margin")
+        else:
+            # Default hidden values if footer is off (to keep consistent state if toggled back)
+            current_config['footer_show_progress'] = st.session_state.get('footer_show_progress', True)
+            current_config['footer_show_pagenum'] = st.session_state.get('footer_show_pagenum', True)
+            current_config['footer_show_title'] = st.session_state.get('footer_show_title', True)
+            current_config['footer_text_pos'] = st.session_state.get('footer_text_pos', "Text Above Bar")
+            current_config['footer_font_size'] = st.session_state.get('footer_font_size', 16)
+            current_config['footer_bar_height'] = st.session_state.get('footer_bar_height', 4)
+            current_config['footer_bottom_margin'] = st.session_state.get('footer_bottom_margin', 10)
 
         st.divider()
         st.header("3. View")
@@ -563,6 +744,18 @@ def main():
         if st.session_state.processor.is_ready and st.session_state.processor.total_pages > 0:
             relative_pos = st.session_state.current_page / st.session_state.processor.total_pages
 
+        # Build Footer Settings Dict
+        footer_settings = {
+            "footer_visible": current_config['footer_visible'],
+            "footer_font_size": current_config['footer_font_size'],
+            "footer_show_progress": current_config['footer_show_progress'],
+            "footer_show_pagenum": current_config['footer_show_pagenum'],
+            "footer_show_title": current_config['footer_show_title'],
+            "footer_text_pos": current_config['footer_text_pos'],
+            "footer_bar_height": current_config['footer_bar_height'],
+            "footer_bottom_margin": current_config['footer_bottom_margin']
+        }
+
         with st.spinner("Rendering layout... (Step 2/2)"):
             success = st.session_state.processor.render_chapters(
                 set(st.session_state.selected_chapter_indices),
@@ -575,7 +768,8 @@ def main():
                 current_config['top_pad'],
                 current_config['align'],
                 current_config['orientation'],
-                current_config['use_toc']
+                current_config['use_toc'],
+                footer_settings=footer_settings
             )
 
             if success:
