@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import struct
 import fitz  # PyMuPDF
-from PIL import Image, ImageEnhance, ImageDraw, ImageFont
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageOps
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup, NavigableString
@@ -12,12 +12,13 @@ import re
 import tempfile
 import io
 import json
+from urllib.parse import unquote
 
 # --- CONFIGURATION DEFAULTS ---
 DEFAULT_SCREEN_WIDTH = 480
 DEFAULT_SCREEN_HEIGHT = 800
 DEFAULT_RENDER_SCALE = 3.0
-DEFAULT_FONT_SIZE = 22
+DEFAULT_FONT_SIZE = 28
 DEFAULT_MARGIN = 20
 DEFAULT_LINE_HEIGHT = 1.4
 DEFAULT_FONT_WEIGHT = 400
@@ -35,12 +36,23 @@ def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
 
 
 def get_pil_font(font_path, size):
-    try:
-        if font_path and os.path.exists(font_path):
+    # 1. Try Custom Uploaded Font
+    if font_path and os.path.exists(font_path):
+        try:
             return ImageFont.truetype(font_path, size)
-        return ImageFont.load_default()
-    except:
-        return ImageFont.load_default()
+        except:
+            pass
+
+    # 2. Try Default "Georgia" (System Font)
+    # Tries common filenames/names. Note: This requires Georgia to be installed on the system.
+    for font_name in ["Georgia", "Georgia.ttf", "georgia.ttf"]:
+        try:
+            return ImageFont.truetype(font_name, size)
+        except:
+            continue
+
+    # 3. Last Resort Fallback
+    return ImageFont.load_default()
 
 
 def extract_all_css(book):
@@ -74,7 +86,9 @@ def get_official_toc_mapping(book):
                 for sub in item[1]: process_toc_item(sub)
         elif isinstance(item, epub.Link):
             clean_href = item.href.split('#')[0]
-            mapping[clean_href] = item.title
+            filename = os.path.basename(clean_href)
+            if filename not in mapping:
+                mapping[filename] = item.title
 
     for item in book.toc: process_toc_item(item)
     return mapping
@@ -116,6 +130,8 @@ class EpubProcessor:
         self.book_images = {}
         self.book_lang = 'en'
         self.is_parsed = False
+        self.cover_image_obj = None
+        self.global_id_map = {}
 
         # Step 2 Data
         self.fitz_docs = []
@@ -127,19 +143,150 @@ class EpubProcessor:
         self.is_ready = False
         self.temp_dir = tempfile.TemporaryDirectory()
 
-        # Footer Defaults
-        self.footer_visible = True
-        self.footer_font_size = 16
-        self.footer_show_progress = True
-        self.footer_show_pagenum = True
-        self.footer_show_title = True
-        self.footer_text_pos = "Text Above Bar"
-        self.footer_bar_height = 4
-        self.footer_bottom_margin = 10
+        # Layout Settings
+        self.layout_settings = {}
+
+    # --- FOOTNOTE & CONTENT EXTRACTION HELPERS ---
+    def _smart_extract_content(self, elem):
+        if elem.name == 'a':
+            parent = elem.parent
+            if parent and parent.name not in ['body', 'html', 'section']:
+                return parent
+            return elem
+        if elem.name in ['aside', 'li', 'dd', 'div']:
+            return elem
+        text = elem.get_text(strip=True)
+        if len(text) > 1:
+            return elem
+        parent = elem.parent
+        if parent:
+            if parent.name in ['body', 'html', 'section']:
+                return elem
+            return parent
+        return elem
+
+    def _build_global_id_map(self, book):
+        id_map = {}
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            try:
+                soup = BeautifulSoup(item.get_content(), 'html.parser')
+                filename = os.path.basename(item.get_name())
+                for elem in soup.find_all(id=True):
+                    target_node = self._smart_extract_content(elem)
+                    import copy
+                    content_node = copy.copy(target_node)
+                    original_raw_html = content_node.decode_contents().strip()
+
+                    for a in content_node.find_all('a'):
+                        if a.get('role') in ['doc-backlink', 'doc-noteref']:
+                            a.decompose()
+                            continue
+                        text = a.get_text(strip=True)
+                        if any(x in text for x in ['↑', 'site', 'back', 'return', '↩']):
+                            a.decompose()
+                            continue
+                        if len(text) < 5 and re.match(r'^[\s\[\(]*\d+[\.\)\]]*$', text):
+                            a.decompose()
+                            continue
+
+                    final_html = content_node.decode_contents().strip()
+                    if not final_html and original_raw_html:
+                        final_html = original_raw_html
+                    if final_html:
+                        id_map[f"{filename}#{elem['id']}"] = final_html
+            except Exception:
+                pass
+        return id_map
+
+    def _inject_inline_footnotes(self, soup, current_filename):
+        if not self.global_id_map: return soup
+        links = soup.find_all('a', href=True)
+        for link in reversed(list(links)):
+            raw_href = link['href']
+            href = unquote(raw_href)
+            text = link.get_text(strip=True)
+            if not text and not link.find('sup'): continue
+
+            parent_classes = []
+            for parent in link.parents:
+                if parent.get('class'): parent_classes.extend(parent.get('class'))
+            if any(x in [c.lower() for c in parent_classes] for x in
+                   ['footnote', 'endnote', 'reflist', 'bibliography']):
+                continue
+
+            is_footnote = False
+            if 'noteref' in link.get('epub:type', '') or link.get('role') == 'doc-noteref': is_footnote = True
+            css = link.get('class', [])
+            if isinstance(css, list): css = " ".join(css)
+            if any(x in css.lower() for x in ['footnote', 'noteref', 'ref']): is_footnote = True
+            if not is_footnote and text:
+                clean_t = text.strip()
+                if re.match(r'^[\(\[]?\d+[\)\]]?$', clean_t) or clean_t == '*':
+                    is_footnote = True
+                elif re.match(r'^[\(\[]?[ivx]+[\)\]]?$', clean_t.lower()):
+                    is_footnote = True
+
+            if not is_footnote: continue
+
+            content = None
+            if '#' in href:
+                parts = href.rsplit('#', 1)
+                href_path = parts[0]
+                href_id = parts[1]
+                f_name = os.path.basename(href_path) if href_path else current_filename
+                key = f"{f_name}#{href_id}"
+                content = self.global_id_map.get(key)
+                if not content:
+                    suffix = f"#{href_id}"
+                    for k, v in self.global_id_map.items():
+                        if k.endswith(suffix):
+                            content = v
+                            break
+
+            if content:
+                new_marker = soup.new_tag("sup")
+                new_marker.string = text if text else "*"
+                new_marker['class'] = "fn-marker"
+                link.replace_with(new_marker)
+                note_box = soup.new_tag("div")
+                note_box['class'] = "inline-footnote-box"
+                header = soup.new_tag("strong")
+                header.string = f"{text}: "
+                note_box.append(header)
+                content_soup = BeautifulSoup(content, 'html.parser')
+                note_box.append(content_soup)
+                parent_block = new_marker.find_parent(['p', 'div', 'li', 'h1', 'h2', 'blockquote'])
+                if parent_block:
+                    parent_block.insert_after(note_box)
+                else:
+                    new_marker.insert_after(note_box)
+        return soup
+
+    def _find_cover_image(self, book):
+        # 1. Try Metadata
+        try:
+            cover_data = book.get_metadata('OPF', 'cover')
+            if cover_data:
+                cover_id = cover_data[0][1]
+                item = book.get_item_with_id(cover_id)
+                if item:
+                    return Image.open(io.BytesIO(item.get_content()))
+        except:
+            pass
+        # 2. Try Item Names
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            name = item.get_name().lower()
+            if 'cover' in name:
+                return Image.open(io.BytesIO(item.get_content()))
+        # 3. Fallback: First image
+        for item in book.get_items_of_type(ebooklib.ITEM_IMAGE):
+            return Image.open(io.BytesIO(item.get_content()))
+        return None
 
     # --- STEP 1: PARSE STRUCTURE (FAST) ---
     def parse_structure(self, epub_bytes):
         self.raw_chapters = []
+        self.cover_image_obj = None
         epub_temp_path = os.path.join(self.temp_dir.name, "input.epub")
         with open(epub_temp_path, "wb") as f:
             f.write(epub_bytes)
@@ -148,6 +295,12 @@ class EpubProcessor:
             book = epub.read_epub(epub_temp_path)
         except Exception as e:
             return False, f"Error reading EPUB: {e}"
+
+        # Extract Cover
+        self.cover_image_obj = self._find_cover_image(book)
+
+        # Build ID Map for Footnotes
+        self.global_id_map = self._build_global_id_map(book)
 
         try:
             self.book_lang = book.get_metadata('DC', 'language')[0][0]
@@ -163,30 +316,229 @@ class EpubProcessor:
 
         for idx, item in enumerate(items):
             item_name = item.get_name()
+            item_filename = os.path.basename(item_name)
             raw_html = item.get_content().decode('utf-8', errors='replace')
             soup = BeautifulSoup(raw_html, 'html.parser')
             text_content = soup.get_text().strip()
             has_image = bool(soup.find('img'))
 
-            if item_name not in toc_mapping and len(text_content) < 50 and not has_image:
-                continue
-
-            chapter_title = toc_mapping.get(item_name) or (soup.find(['h1', 'h2']).get_text().strip() if soup.find(
-                ['h1', 'h2']) else f"Section {len(self.raw_chapters) + 1}")
+            chapter_title = toc_mapping.get(item_filename)
+            if not chapter_title:
+                # Fallback Title logic
+                for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                    header = soup.find(tag)
+                    if header:
+                        t = header.get_text().strip()
+                        if t and len(t) < 150:
+                            chapter_title = t
+                            break
+                if not chapter_title:
+                    chapter_title = f"Section {len(self.raw_chapters) + 1}"
 
             self.raw_chapters.append({
                 'title': chapter_title,
                 'soup': soup,
-                'has_image': has_image
+                'has_image': has_image,
+                'filename': item_filename
             })
 
         self.is_parsed = True
         return True, "Success"
 
+    # --- HEADER / FOOTER DRAWING FUNCTIONS ---
+    def _draw_progress_bar(self, draw, y, height, global_page_index):
+        if self.total_pages <= 0: return
+        s = self.layout_settings
+
+        show_ticks = s.get("bar_show_ticks", True)
+        tick_h = s.get("bar_tick_height", 6)
+        show_marker = s.get("bar_show_marker", True)
+        marker_r = s.get("bar_marker_radius", 5)
+        marker_col_str = s.get("bar_marker_color", "Black")
+        marker_fill = (255, 255, 255) if marker_col_str == "White" else (0, 0, 0)
+
+        draw.rectangle([10, y, self.screen_width - 10, y + height], fill=(255, 255, 255), outline=(0, 0, 0))
+
+        if show_ticks:
+            bar_center_y = y + (height / 2)
+            t_top = bar_center_y - (tick_h / 2)
+            t_bot = bar_center_y + (tick_h / 2)
+            chapter_pages = [item[1] for item in self.toc_data_final]
+            for cp in chapter_pages:
+                mx = int(((cp - 1) / self.total_pages) * (self.screen_width - 20)) + 10
+                draw.line([mx, t_top, mx, t_bot], fill=(0, 0, 0), width=1)
+
+        curr_page_disp = global_page_index + 1
+        bar_width_px = self.screen_width - 20
+        fill_width = int((curr_page_disp / self.total_pages) * bar_width_px)
+
+        draw.rectangle([10, y, 10 + fill_width, y + height], fill=(0, 0, 0))
+
+        if show_marker:
+            cx = 10 + fill_width
+            cy = y + (height / 2)
+            draw.ellipse([cx - marker_r, cy - marker_r, cx + marker_r, cy + marker_r],
+                         fill=marker_fill, outline=(0, 0, 0))
+
+    def _get_page_text_elements(self, global_page_index):
+        page_num_disp = global_page_index + 1
+        percent = int((page_num_disp / self.total_pages) * 100) if self.total_pages > 0 else 0
+        current_title = ""
+
+        num_toc = len(self.toc_pages_images)
+        if global_page_index < num_toc:
+            current_title = "Table of Contents"
+            chap_page_disp = f"{global_page_index + 1}/{num_toc}"
+        else:
+            for title, start_pg in reversed(self.toc_data_final):
+                if page_num_disp >= start_pg:
+                    current_title = title
+                    break
+
+            pm_idx = global_page_index - num_toc
+            if 0 <= pm_idx < len(self.page_map):
+                doc_idx, page_idx = self.page_map[pm_idx]
+                doc_ref = self.fitz_docs[doc_idx][0]
+                chap_total = len(doc_ref)
+                chap_page_disp = f"{page_idx + 1}/{chap_total}"
+            else:
+                chap_page_disp = "1/1"
+
+        return {
+            'pagenum': f"{page_num_disp}/{self.total_pages}",
+            'title': current_title,
+            'chap_page': chap_page_disp,
+            'percent': f"{percent}%"
+        }
+
+    # --- ROBUST TEXT LAYOUT ENGINE ---
+    def _draw_text_line(self, draw, y, font, elements_list, align):
+        if not elements_list: return
+
+        margin_x = 20
+        canvas_width = self.screen_width - (margin_x * 2)
+        separator = "  |  "
+        sep_w = font.getlength(separator)
+
+        title_item = None
+        fixed_items = []
+        for key, txt in elements_list:
+            if key == 'title':
+                title_item = txt
+            else:
+                fixed_items.append(txt)
+
+        fixed_text_w = sum(font.getlength(txt) for txt in fixed_items)
+        total_seps_w = sep_w * (len(elements_list) - 1) if len(elements_list) > 1 else 0
+
+        available_for_title = canvas_width - fixed_text_w - total_seps_w
+
+        display_title = title_item if title_item else ""
+        if title_item:
+            if font.getlength(title_item) > available_for_title:
+                t = title_item
+                while len(t) > 0 and font.getlength(t + "...") > available_for_title:
+                    t = t[:-1]
+                display_title = t + "..." if t else ""
+
+        final_strings = []
+        for key, txt in elements_list:
+            if key == 'title':
+                final_strings.append(display_title)
+            else:
+                final_strings.append(txt)
+
+        final_strings = [s for s in final_strings if s]
+
+        if align == "Justify" and len(final_strings) > 1:
+            draw.text((margin_x, y), final_strings[0], font=font, fill=(0, 0, 0))
+            last_txt = final_strings[-1]
+            last_w = font.getlength(last_txt)
+            draw.text((self.screen_width - margin_x - last_w, y), last_txt, font=font, fill=(0, 0, 0))
+            if len(final_strings) > 2:
+                mid_txt = separator.join(final_strings[1:-1])
+                mid_w = font.getlength(mid_txt)
+                mid_x = (self.screen_width - mid_w) // 2
+                draw.text((mid_x, y), mid_txt, font=font, fill=(0, 0, 0))
+        else:
+            full_line = separator.join(final_strings)
+            line_w = font.getlength(full_line)
+            if align == "Center":
+                x = (self.screen_width - line_w) // 2
+            elif align == "Right":
+                x = self.screen_width - margin_x - line_w
+            else:
+                x = margin_x
+            draw.text((x, y), full_line, font=font, fill=(0, 0, 0))
+
+    def _draw_header(self, draw, global_page_index):
+        s = self.layout_settings
+        font_size = s.get("header_font_size", 16)
+        margin = s.get("header_margin", 10)
+        align = s.get("header_align", "Center")
+        bar_h = s.get("bar_height", 4)
+        pos_prog = s.get("pos_progress", "Footer (Below Text)")
+        text_data = self._get_page_text_elements(global_page_index)
+        elements = self._get_active_elements("Header", text_data)
+        font_ui = self._get_ui_font(font_size)
+        curr_y = margin
+        gap = 6
+        if "Header" in pos_prog:
+            if "Above" in pos_prog:
+                self._draw_progress_bar(draw, curr_y, bar_h, global_page_index)
+                curr_y += bar_h + gap
+                if elements: self._draw_text_line(draw, curr_y, font_ui, elements, align)
+            else:
+                if elements:
+                    self._draw_text_line(draw, curr_y, font_ui, elements, align)
+                    curr_y += font_size + gap
+                self._draw_progress_bar(draw, curr_y, bar_h, global_page_index)
+        elif elements:
+            self._draw_text_line(draw, curr_y, font_ui, elements, align)
+
+    def _draw_footer(self, draw, global_page_index):
+        s = self.layout_settings
+        font_size = s.get("footer_font_size", 16)
+        margin = s.get("footer_margin", 10)
+        align = s.get("footer_align", "Center")
+        bar_h = s.get("bar_height", 4)
+        pos_prog = s.get("pos_progress", "Footer (Below Text)")
+        text_data = self._get_page_text_elements(global_page_index)
+        elements = self._get_active_elements("Footer", text_data)
+        font_ui = self._get_ui_font(font_size)
+        gap = 6
+        base_y = self.screen_height - margin
+        if "Footer" in pos_prog:
+            if "Below" in pos_prog:
+                bar_y = base_y - bar_h
+                text_y = bar_y - gap - font_size
+                self._draw_progress_bar(draw, bar_y, bar_h, global_page_index)
+                if elements: self._draw_text_line(draw, text_y, font_ui, elements, align)
+            else:
+                text_y = base_y - font_size
+                bar_y = text_y - gap - bar_h
+                if elements: self._draw_text_line(draw, text_y, font_ui, elements, align)
+                self._draw_progress_bar(draw, bar_y, bar_h, global_page_index)
+        elif elements:
+            self._draw_text_line(draw, base_y - font_size, font_ui, elements, align)
+
+    def _get_active_elements(self, bar_role, text_data):
+        s = self.layout_settings
+        active = []
+        for key in ['title', 'pagenum', 'chap_page', 'percent']:
+            pos_val = s.get(f"pos_{key}", "Hidden")
+            if pos_val == bar_role:
+                order = int(s.get(f"order_{key}", 99))
+                content = text_data.get(key, "")
+                if content:
+                    active.append((order, key, content))
+        active.sort(key=lambda x: x[0])
+        return [(x[1], x[2]) for x in active]
+
     # --- STEP 2: RENDER (SLOW) ---
     def render_chapters(self, selected_indices_set, font_path, font_size, margin, line_height, font_weight,
-                        bottom_padding, top_padding, text_align, orientation, add_toc, footer_settings=None):
-
+                        bottom_padding, top_padding, text_align, orientation, add_toc, layout_settings=None,
+                        show_footnotes=True):
         self.font_path = font_path
         self.font_size = int(font_size)
         self.margin = margin
@@ -195,17 +547,7 @@ class EpubProcessor:
         self.bottom_padding = bottom_padding
         self.top_padding = top_padding
         self.text_align = text_align
-
-        # Apply Footer Settings
-        if footer_settings:
-            self.footer_visible = footer_settings.get("footer_visible", True)
-            self.footer_font_size = footer_settings.get("footer_font_size", 16)
-            self.footer_show_progress = footer_settings.get("footer_show_progress", True)
-            self.footer_show_pagenum = footer_settings.get("footer_show_pagenum", True)
-            self.footer_show_title = footer_settings.get("footer_show_title", True)
-            self.footer_text_pos = footer_settings.get("footer_text_pos", "Text Above Bar")
-            self.footer_bar_height = footer_settings.get("footer_bar_height", 4)
-            self.footer_bottom_margin = footer_settings.get("footer_bottom_margin", 10)
+        self.layout_settings = layout_settings if layout_settings else {}
 
         if orientation == "Landscape":
             self.screen_width = DEFAULT_SCREEN_HEIGHT
@@ -248,13 +590,15 @@ class EpubProcessor:
             }}
             img {{ max-width: 95% !important; height: auto !important; display: block; margin: 20px auto !important; }}
             h1, h2, h3 {{ text-align: center !important; margin-top: 1em; font-weight: {min(900, self.font_weight + 200)} !important; }}
+            .fn-marker {{ font-weight: bold; font-size: 0.7em !important; vertical-align: super; color: solid black !important; }}
+            .inline-footnote-box {{ display: block; margin: 15px 0px; padding: 0px 15px; border-left: 4px solid solid black; font-size: {int(self.font_size * 0.85)}pt !important; line-height: {self.line_height} !important; }}
+            .inline-footnote-box p {{ margin: 0 !important; padding: 0 !important; font-size: inherit !important; display: inline; }}
         </style>
         """
 
         temp_chapter_starts = []
         running_page_count = 0
         final_toc_titles = []
-
         progress_bar = st.progress(0)
         status_text = st.empty()
         total_chapters = len(self.raw_chapters)
@@ -262,29 +606,23 @@ class EpubProcessor:
         for idx, chapter in enumerate(self.raw_chapters):
             status_text.text(f"Rendering chapter {idx + 1}/{total_chapters}...")
             progress_bar.progress(int((idx / total_chapters) * 90))
-
             soup = chapter['soup']
+            if show_footnotes: soup = self._inject_inline_footnotes(soup, chapter.get('filename', ''))
             for img_tag in soup.find_all('img'):
                 src = os.path.basename(img_tag.get('src', ''))
                 if src in self.book_images: img_tag['src'] = self.book_images[src]
-
             soup = hyphenate_html_text(soup, self.book_lang)
-
             if idx in selected_indices_set:
                 temp_chapter_starts.append(running_page_count)
                 final_toc_titles.append(chapter['title'])
-
             body_content = "".join([str(x) for x in soup.body.contents]) if soup.body else str(soup)
             final_html = f"<html lang='{self.book_lang}'><head><style>{patched_css}</style>{custom_css}</head><body>{body_content}</body></html>"
-
             temp_html_path = os.path.join(self.temp_dir.name, f"render_{idx}.html")
             with open(temp_html_path, "w", encoding="utf-8") as f:
                 f.write(final_html)
-
             doc = fitz.open(temp_html_path)
             rect = fitz.Rect(0, 0, self.screen_width, self.screen_height)
             doc.layout(rect=rect)
-
             self.fitz_docs.append((doc, chapter['has_image']))
             for i in range(len(doc)): self.page_map.append((len(self.fitz_docs) - 1, i))
             running_page_count += len(doc)
@@ -293,10 +631,8 @@ class EpubProcessor:
             toc_header_space = 100 + self.top_padding
             self.toc_row_height = int(self.font_size * self.line_height * 1.2)
             available_h = self.screen_height - self.bottom_padding - toc_header_space
-
             self.toc_items_per_page = max(1, int(available_h // self.toc_row_height))
             num_toc_pages = (len(final_toc_titles) + self.toc_items_per_page - 1) // self.toc_items_per_page
-
             self.toc_data_final = [(t, temp_chapter_starts[i] + num_toc_pages + 1) for i, t in
                                    enumerate(final_toc_titles)]
             self.toc_pages_images = self._render_toc_pages(self.toc_data_final)
@@ -305,16 +641,14 @@ class EpubProcessor:
             self.toc_pages_images = []
 
         self.total_pages = len(self.toc_pages_images) + len(self.page_map)
-
         status_text.empty()
         progress_bar.empty()
         self.is_ready = True
         return True
 
     def _get_ui_font(self, size):
-        if self.font_path and os.path.exists(self.font_path):
-            return get_pil_font(self.font_path, int(size))
-        return ImageFont.load_default()
+        # Pass the path (even if None) so get_pil_font can handle the Georgia fallback
+        return get_pil_font(self.font_path, int(size))
 
     def _render_toc_pages(self, toc_entries):
         pages = []
@@ -322,53 +656,40 @@ class EpubProcessor:
         header_size = int(self.font_size * 1.2)
         font_main = self._get_ui_font(main_size)
         font_header = self._get_ui_font(header_size)
-        base_stroke = 1 if self.font_weight > 500 else 0
-        header_stroke = 1 if self.font_weight > 400 else 0
         left_margin, right_margin, column_gap = 40, 40, 20
         limit = self.toc_items_per_page
-
         for i in range(0, len(toc_entries), limit):
             chunk = toc_entries[i: i + limit]
             img = Image.new('1', (self.screen_width, self.screen_height), 1)
             draw = ImageDraw.Draw(img)
-
             header_text = "TABLE OF CONTENTS"
             header_w = font_header.getlength(header_text)
             header_y = 40 + self.top_padding
-            draw.text(((self.screen_width - header_w) // 2, header_y), header_text, font=font_header, fill=0,
-                      stroke_width=header_stroke)
+            draw.text(((self.screen_width - header_w) // 2, header_y), header_text, font=font_header, fill=0)
             line_y = header_y + int(header_size * 1.5)
             draw.line((left_margin, line_y, self.screen_width - right_margin, line_y), fill=0)
             y = line_y + int(main_size * 1.2)
-
             for title, pg_num in chunk:
                 pg_str = str(pg_num)
                 pg_w = font_main.getlength(pg_str)
                 max_title_w = self.screen_width - left_margin - right_margin - pg_w - column_gap
                 display_title = title
-                try:
-                    if font_main.getlength(display_title) > max_title_w:
-                        while font_main.getlength(display_title + "...") > max_title_w and len(display_title) > 0:
-                            display_title = display_title[:-1]
-                        display_title += "..."
-                except:
-                    pass
-
-                draw.text((left_margin, y), display_title, font=font_main, fill=0, stroke_width=base_stroke)
+                if font_main.getlength(display_title) > max_title_w:
+                    while font_main.getlength(display_title + "...") > max_title_w and len(display_title) > 0:
+                        display_title = display_title[:-1]
+                    display_title += "..."
+                draw.text((left_margin, y), display_title, font=font_main, fill=0)
                 title_end_x = left_margin + font_main.getlength(display_title) + 5
                 dots_end_x = self.screen_width - right_margin - pg_w - 10
                 if dots_end_x > title_end_x:
                     try:
-                        dot_char = "."
-                        dot_w = font_main.getlength(dot_char)
+                        dot_w = font_main.getlength(".")
                         if dot_w > 0:
                             dots_count = int((dots_end_x - title_end_x) / dot_w)
                             draw.text((title_end_x, y), "." * dots_count, font=font_main, fill=0)
                     except:
                         pass
-
-                draw.text((self.screen_width - right_margin - pg_w, y), pg_str, font=font_main, fill=0,
-                          stroke_width=base_stroke)
+                draw.text((self.screen_width - right_margin - pg_w, y), pg_str, font=font_main, fill=0)
                 y += self.toc_row_height
             pages.append(img)
         return pages
@@ -376,10 +697,9 @@ class EpubProcessor:
     def render_page(self, global_page_index):
         if not self.is_ready: return None
         num_toc = len(self.toc_pages_images)
-        footer_height = max(0, self.bottom_padding)
-        header_height = max(0, self.top_padding)
-        content_height = self.screen_height - footer_height - header_height
-
+        footer_padding = max(0, self.bottom_padding)
+        header_padding = max(0, self.top_padding)
+        content_height = self.screen_height - footer_padding - header_padding
         if global_page_index < num_toc:
             img = self.toc_pages_images[global_page_index].copy().convert("RGB")
         else:
@@ -391,7 +711,7 @@ class EpubProcessor:
             img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
             img_content = img_content.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert("L")
             img = Image.new("RGB", (self.screen_width, self.screen_height), (255, 255, 255))
-            img.paste(img_content, (0, header_height))
+            img.paste(img_content, (0, header_padding))
             if has_image:
                 img = img.convert("L")
                 img = ImageEnhance.Contrast(ImageEnhance.Brightness(img).enhance(1.15)).enhance(1.4)
@@ -400,98 +720,12 @@ class EpubProcessor:
                 img = img.convert("L")
                 img = ImageEnhance.Contrast(img).enhance(2.0).point(lambda p: 255 if p > 140 else 0, mode='1')
             img = img.convert("RGB")
-
-        # --- DYNAMIC FOOTER RENDERING ---
-        if self.footer_visible:
-            draw = ImageDraw.Draw(img)
-
-            # 1. Clean background for footer area based on user margin + buffer
-            clean_start_y = self.screen_height - self.bottom_padding
-            draw.rectangle([0, clean_start_y, self.screen_width, self.screen_height], fill=(255, 255, 255))
-
-            # 2. Calculate Layout
-            font_ui = self._get_ui_font(self.footer_font_size)
-            text_height_px = int(self.footer_font_size * 1.3)
-            bar_thickness = self.footer_bar_height if self.footer_show_progress else 0
-
-            element_gap = 5
-
-            # Position Reference: footer_bottom_margin is distance from BOTTOM of screen
-            base_y = self.screen_height - self.footer_bottom_margin
-
-            bar_y = 0
-            text_y = 0
-
-            if self.footer_text_pos == "Text Above Bar":
-                # Layout from bottom up: Margin -> Bar -> Gap -> Text
-                if self.footer_show_progress:
-                    bar_y = base_y - bar_thickness
-                    text_ref = bar_y - element_gap
-                else:
-                    text_ref = base_y
-
-                text_y = text_ref - text_height_px + 3  # +3 adjustment for font baseline
-
-            else:  # "Text Below Bar"
-                # Layout from bottom up: Margin -> Text -> Gap -> Bar
-                has_text = self.footer_show_pagenum or self.footer_show_title
-                if has_text:
-                    text_y = base_y - text_height_px
-                    bar_ref = text_y - element_gap
-                else:
-                    bar_ref = base_y
-
-                bar_y = bar_ref - bar_thickness
-
-            # 3. Draw Progress Bar
-            if self.footer_show_progress:
-                draw.rectangle([10, bar_y, self.screen_width - 10, bar_y + bar_thickness], fill=(255, 255, 255),
-                               outline=(0, 0, 0))
-
-                # Chapters ticks
-                chapter_pages = [item[1] for item in self.toc_data_final]
-                for cp in chapter_pages:
-                    if self.total_pages > 0:
-                        mx = int(((cp - 1) / self.total_pages) * (self.screen_width - 20)) + 10
-                        draw.line([mx, bar_y - 1, mx, bar_y + bar_thickness + 1], fill=(0, 0, 0), width=1)
-
-                # Fill progress
-                page_num_disp = global_page_index + 1
-                if self.total_pages > 0:
-                    bw = int((page_num_disp / self.total_pages) * (self.screen_width - 20))
-                    draw.rectangle([10, bar_y, 10 + bw, bar_y + bar_thickness], fill=(0, 0, 0))
-
-            # 4. Draw Text Elements
-            has_text = self.footer_show_pagenum or self.footer_show_title
-            if has_text:
-                page_num_disp = global_page_index + 1
-                current_title = ""
-                for title, start_pg in reversed(self.toc_data_final):
-                    if page_num_disp >= start_pg:
-                        current_title = title
-                        break
-
-                cursor_x = 15
-
-                # Draw Page Num
-                if self.footer_show_pagenum:
-                    pg_text = f"{page_num_disp}/{self.total_pages}"
-                    draw.text((cursor_x, text_y), pg_text, font=font_ui, fill=(0, 0, 0))
-                    cursor_x += font_ui.getlength(pg_text) + 15
-
-                    if self.footer_show_title and current_title:
-                        draw.text((cursor_x - 10, text_y), "|", font=font_ui, fill=(0, 0, 0))
-
-                # Draw Title
-                if self.footer_show_title and current_title:
-                    available_width = self.screen_width - cursor_x - 10
-                    display_title = current_title
-                    if font_ui.getlength(display_title) > available_width:
-                        while font_ui.getlength(display_title + "...") > available_width and len(display_title) > 0:
-                            display_title = display_title[:-1]
-                        display_title += "..."
-                    draw.text((cursor_x, text_y), display_title, font=font_ui, fill=(0, 0, 0))
-
+        draw = ImageDraw.Draw(img)
+        if header_padding > 0: draw.rectangle([0, 0, self.screen_width, header_padding], fill=(255, 255, 255))
+        if footer_padding > 0: draw.rectangle(
+            [0, self.screen_height - footer_padding, self.screen_width, self.screen_height], fill=(255, 255, 255))
+        self._draw_header(draw, global_page_index)
+        self._draw_footer(draw, global_page_index)
         return img
 
     def get_xtc_bytes(self):
@@ -499,15 +733,13 @@ class EpubProcessor:
         blob, idx = bytearray(), bytearray()
         data_off = 56 + (16 * self.total_pages)
         prog_text = st.empty()
-
         for i in range(self.total_pages):
             if i % 10 == 0: prog_text.text(f"Exporting page {i + 1}/{self.total_pages}...")
-            img = self.render_page(i).convert("L").point(lambda p: 255 if p > 128 else 0, mode='1')
+            img = self.render_page(i).convert("L").convert("1", dither=Image.Dither.FLOYDSTEINBERG)
             w, h = img.size
             xtg = struct.pack("<IHHBBIQ", 0x00475458, w, h, 0, 0, ((w + 7) // 8) * h, 0) + img.tobytes()
             idx.extend(struct.pack("<QIHH", data_off + len(blob), len(xtg), w, h))
             blob.extend(xtg)
-
         header = struct.pack("<IHHBBBBIQQQQQ", 0x00435458, 0x0100, self.total_pages, 0, 0, 0, 0, 0, 0, 56, data_off, 0,
                              0)
         prog_text.empty()
@@ -516,15 +748,67 @@ class EpubProcessor:
 
 # --- STREAMLIT APP ---
 
+# HELPER: MAPPING DICTIONARY FOR COMPATIBILITY
+# Streamlit Widget Key -> CTK JSON Key
+KEY_MAP = {
+    "top_pad": "top_padding",
+    "bot_pad": "bottom_padding",
+    "align": "text_align",
+    "use_toc": "generate_toc",
+    "pos_perc": "pos_percent",
+    "ord_title": "order_title",
+    "ord_pagenum": "order_pagenum",
+    "ord_chap": "order_chap_page",
+    "ord_perc": "order_percent",
+    "pos_chap": "pos_chap_page",
+    "font_size": "font_size",
+    "margin": "margin",
+    "line_height": "line_height",
+    "font_weight": "font_weight",
+    "orientation": "orientation",
+    "show_footnotes": "show_footnotes",
+    "pos_title": "pos_title",
+    "pos_pagenum": "pos_pagenum",
+    "pos_progress": "pos_progress",
+    "bar_height": "bar_height",
+    "bar_tick_height": "bar_tick_height",
+    "bar_marker_radius": "bar_marker_radius",
+    "bar_marker_color": "bar_marker_color",
+    "bar_show_ticks": "bar_show_ticks",
+    "bar_show_marker": "bar_show_marker",
+    "header_font_size": "header_font_size",
+    "header_align": "header_align",
+    "header_margin": "header_margin",
+    "footer_font_size": "footer_font_size",
+    "footer_align": "footer_align",
+    "footer_margin": "footer_margin"
+}
+
+
+def get_current_settings_for_export():
+    """Gathers settings from Session State and maps to CTK keys."""
+    export_data = {}
+    for st_key, ctk_key in KEY_MAP.items():
+        if st_key in st.session_state:
+            export_data[ctk_key] = st.session_state[st_key]
+
+    # Defaults for anything missing from session state
+    if "font_name" not in export_data: export_data["font_name"] = "Default (System)"
+    if "preview_zoom" not in export_data: export_data["preview_zoom"] = 300
+
+    return json.dumps(export_data, indent=4)
+
+
 def main():
     st.set_page_config(page_title="EPUB to XTC Live", layout="wide", initial_sidebar_state="expanded")
 
     st.markdown("""
     <style>
-        section[data-testid="stSidebar"] { width: 400px !important; }
+        section[data-testid="stSidebar"] { width: 450px !important; }
         .block-container { padding-top: 1rem; padding-bottom: 1rem; }
         header[data-testid="stHeader"] { background-color: rgba(0,0,0,0); }
         header[data-testid="stHeader"] > div:first-child { background: transparent; }
+        div[data-testid="stExpander"] div[role="button"] p { font-size: 1rem; font-weight: 600; }
     </style>
     """, unsafe_allow_html=True)
 
@@ -538,13 +822,78 @@ def main():
 
     # --- SIDEBAR ---
     with st.sidebar:
+        # --- PRESETS SECTION (Moved to Top for visibility) ---
+        with st.expander("Presets (Save/Load)", expanded=False):
+            # 1. LOAD SECTION
+            uploaded_preset = st.file_uploader("Load Preset (JSON)", type=["json"])
+
+            if uploaded_preset:
+                preset_id = f"{uploaded_preset.name}_{uploaded_preset.size}"
+                if st.session_state.get('applied_preset_id') != preset_id:
+                    try:
+                        loaded_data = json.load(uploaded_preset)
+
+                        # Reverse Map: CTK Key -> Streamlit Key
+                        REVERSE_MAP = {v: k for k, v in KEY_MAP.items()}
+
+                        for k, v in loaded_data.items():
+                            target_key = REVERSE_MAP.get(k, k)
+                            st.session_state[target_key] = v
+
+                        st.session_state['applied_preset_id'] = preset_id
+                        st.success("Preset applied!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error loading preset: {e}")
+            elif 'applied_preset_id' in st.session_state:
+                del st.session_state['applied_preset_id']
+
+            # 2. SAVE SECTION (Cross-Compatible with CTK)
+            # Use callback to generate JSON right when button is clicked
+            st.download_button(
+                label="💾 Download Current Preset",
+                data=get_current_settings_for_export(),
+                file_name="epub_2_xtc_preset.json",
+                mime="application/json",
+                use_container_width=True
+            )
+
+        st.divider()
+
+        current_config = {}
         if st.session_state.processor.is_ready:
             st.success("✅ Book Ready")
-            if st.button("Download XTC", type="primary", use_container_width=True):
-                with st.spinner("Generating..."):
-                    xtc_data = st.session_state.processor.get_xtc_bytes()
-                    st.download_button("Save File", data=xtc_data, file_name="book.xtc",
-                                       mime="application/octet-stream")
+            col_dl, col_cov = st.columns(2)
+            with col_dl:
+                if st.button("Download XTC", type="primary", use_container_width=True):
+                    with st.spinner("Generating..."):
+                        xtc_data = st.session_state.processor.get_xtc_bytes()
+                        st.download_button("Save XTC", data=xtc_data, file_name="book.xtc",
+                                           mime="application/octet-stream")
+            with col_cov:
+                with st.popover("Export Cover", use_container_width=True):
+                    if st.session_state.processor.cover_image_obj:
+                        st.write("Cover Settings")
+                        cv_w = st.number_input("Width", value=480)
+                        cv_h = st.number_input("Height", value=800)
+                        cv_mode = st.selectbox("Mode", ["Crop to Fill", "Fit", "Stretch"])
+                        if st.button("Generate BMP"):
+                            img = st.session_state.processor.cover_image_obj.convert("RGB")
+                            if cv_mode == "Stretch":
+                                img = img.resize((cv_w, cv_h), Image.Resampling.LANCZOS)
+                            elif cv_mode == "Fit":
+                                img = ImageOps.pad(img, (cv_w, cv_h), color="white", centering=(0.5, 0.5))
+                            else:
+                                img = ImageOps.fit(img, (cv_w, cv_h), centering=(0.5, 0.5))
+                            img = img.convert("L")
+                            img = ImageEnhance.Contrast(img).enhance(1.3)
+                            img = ImageEnhance.Brightness(img).enhance(1.05)
+                            img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+                            buf = io.BytesIO()
+                            img.save(buf, format="BMP")
+                            st.download_button("Download BMP", data=buf.getvalue(), file_name="cover.bmp")
+                    else:
+                        st.warning("No cover found.")
             st.divider()
 
         st.header("1. Input")
@@ -565,157 +914,162 @@ def main():
                     else:
                         st.error(msg)
 
-        # --- PRESET MANAGEMENT (NEW) ---
         st.divider()
-        with st.expander("Presets (Save/Load)", expanded=False):
-            # Uploader
-            uploaded_preset = st.file_uploader("Load Preset (JSON)", type=["json"])
-            if uploaded_preset:
-                try:
-                    loaded_data = json.load(uploaded_preset)
-                    # Update session state keys with loaded data
-                    # Map config keys to widget keys
-                    key_map = {
-                        'orientation': 'orientation', 'align': 'align', 'use_toc': 'use_toc',
-                        'font_size': 'font_size', 'font_weight': 'font_weight',
-                        'line_height': 'line_height', 'margin': 'margin',
-                        'top_pad': 'top_pad', 'bot_pad': 'bot_pad',
-                        'footer_visible': 'footer_visible',
-                        'footer_show_progress': 'footer_show_progress',
-                        'footer_show_pagenum': 'footer_show_pagenum',
-                        'footer_show_title': 'footer_show_title',
-                        'footer_text_pos': 'footer_text_pos',
-                        'footer_font_size': 'footer_font_size',
-                        'footer_bar_height': 'footer_bar_height',
-                        'footer_bottom_margin': 'footer_bottom_margin'
-                    }
-
-                    for json_key, ss_key in key_map.items():
-                        if json_key in loaded_data:
-                            st.session_state[ss_key] = loaded_data[json_key]
-
-                    st.success("Preset loaded! (UI updated)")
-                except Exception as e:
-                    st.error(f"Failed to load preset: {e}")
-
-            # Downloader (Needs current config from session state)
-            # We construct the dict from session_state values if they exist, else defaults
-            current_ss_config = {
-                'orientation': st.session_state.get('orientation', "Portrait"),
-                'align': st.session_state.get('align', "justify"),
-                'use_toc': st.session_state.get('use_toc', True),
-                'font_size': st.session_state.get('font_size', DEFAULT_FONT_SIZE),
-                'font_weight': st.session_state.get('font_weight', DEFAULT_FONT_WEIGHT),
-                'line_height': st.session_state.get('line_height', DEFAULT_LINE_HEIGHT),
-                'margin': st.session_state.get('margin', DEFAULT_MARGIN),
-                'top_pad': st.session_state.get('top_pad', DEFAULT_TOP_PADDING),
-                'bot_pad': st.session_state.get('bot_pad', DEFAULT_BOTTOM_PADDING),
-                'footer_visible': st.session_state.get('footer_visible', True),
-                'footer_show_progress': st.session_state.get('footer_show_progress', True),
-                'footer_show_pagenum': st.session_state.get('footer_show_pagenum', True),
-                'footer_show_title': st.session_state.get('footer_show_title', True),
-                'footer_text_pos': st.session_state.get('footer_text_pos', "Text Above Bar"),
-                'footer_font_size': st.session_state.get('footer_font_size', 16),
-                'footer_bar_height': st.session_state.get('footer_bar_height', 4),
-                'footer_bottom_margin': st.session_state.get('footer_bottom_margin', 10)
-            }
-
-            json_str = json.dumps(current_ss_config, indent=4)
-            st.download_button(
-                label="Download Current Preset",
-                data=json_str,
-                file_name="my_preset.json",
-                mime="application/json"
-            )
-
-        st.divider()
+        st.header("2. Settings")
 
         if st.session_state.processor.is_parsed:
             with st.expander("Chapter Visibility (TOC)", expanded=False):
-                st.info("Unchecked chapters are hidden from TOC but remain in book.")
+                st.info("Unchecked chapters are hidden from navigation but remain in book.")
                 all_titles = [f"{i + 1}. {c['title']}" for i, c in enumerate(st.session_state.processor.raw_chapters)]
                 selected_titles = st.multiselect("Include in Navigation:", all_titles, default=all_titles)
                 st.session_state.selected_chapter_indices = [all_titles.index(t) for t in selected_titles]
-            st.divider()
 
-        st.header("2. Settings")
-        current_config = {}
-        r1_c1, r1_c2 = st.columns(2)
-        with r1_c1:
-            current_config['orientation'] = st.selectbox("Orientation", ["Portrait", "Landscape"], key="orientation")
-        with r1_c2:
-            current_config['align'] = st.selectbox("Alignment", ["justify", "left"], key="align")
+        # Use Session State to persist defaults
+        def get_state(key, default):
+            if key not in st.session_state:
+                st.session_state[key] = default
+            return st.session_state[key]
 
-        current_config['use_toc'] = st.checkbox("Generate TOC Pages", value=True, key="use_toc")
+        with st.expander("Page Body Layout", expanded=True):
+            c1, c2 = st.columns(2)
+            current_config['orientation'] = c1.selectbox("Orientation", ["Portrait", "Landscape"], key="orientation",
+                                                         index=0 if get_state("orientation",
+                                                                              "Portrait") == "Portrait" else 1)
 
-        st.subheader("Typography")
-        r2_c1, r2_c2 = st.columns(2)
-        with r2_c1:
-            current_config['font_size'] = st.number_input("Font Size", 10, 50, DEFAULT_FONT_SIZE, key="font_size")
-        with r2_c2:
-            current_config['font_weight'] = st.number_input("Weight", 100, 900, DEFAULT_FONT_WEIGHT, step=100,
+            align_opts = ["justify", "left"]
+            align_idx = 0 if get_state("align", "justify") == "justify" else 1
+            current_config['align'] = c2.selectbox("Alignment", align_opts, key="align", index=align_idx)
+
+            current_config['use_toc'] = st.checkbox("Generate TOC", value=get_state("use_toc", True), key="use_toc")
+            current_config['show_footnotes'] = st.checkbox("Inline Footnotes", value=get_state("show_footnotes", False),
+                                                           key="show_footnotes")
+            st.subheader("Typography")
+            t1, t2 = st.columns(2)
+            current_config['font_size'] = t1.number_input("Size", 10, 50, get_state("font_size", DEFAULT_FONT_SIZE),
+                                                          key="font_size")
+            current_config['font_weight'] = t2.number_input("Weight", 100, 900,
+                                                            get_state("font_weight", DEFAULT_FONT_WEIGHT), step=100,
                                                             key="font_weight")
-
-        r3_c1, r3_c2 = st.columns(2)
-        with r3_c1:
-            current_config['line_height'] = st.number_input("Line Height", 1.0, 3.0, DEFAULT_LINE_HEIGHT, step=0.1,
+            current_config['line_height'] = st.number_input("Line Height", 1.0, 3.0,
+                                                            get_state("line_height", DEFAULT_LINE_HEIGHT), step=0.1,
                                                             key="line_height")
-        with r3_c2:
-            current_config['margin'] = st.number_input("Margin", 0, 100, DEFAULT_MARGIN, key="margin")
+            st.subheader("Margins & Padding")
 
-        st.subheader("Spacing")
-        r4_c1, r4_c2 = st.columns(2)
-        with r4_c1:
-            current_config['top_pad'] = st.number_input("Top Padding", 0, 100, DEFAULT_TOP_PADDING, key="top_pad")
-        with r4_c2:
-            current_config['bot_pad'] = st.number_input("Bottom Padding", 0, 100, DEFAULT_BOTTOM_PADDING, key="bot_pad")
+            # Create two side-by-side columns for the padding inputs
+            pad_col1, pad_col2 = st.columns(2)
 
-        # --- FOOTER SETTINGS (NEW) ---
+            with pad_col1:
+                current_config['top_pad'] = st.number_input("Top Padding", 0, 150,
+                                                            get_state("top_pad", DEFAULT_TOP_PADDING), key="top_pad")
+
+            with pad_col2:
+                current_config['bot_pad'] = st.number_input("Bottom Padding", 0, 150,
+                                                            get_state("bot_pad", DEFAULT_BOTTOM_PADDING),
+                                                            key="bot_pad")
+
+            # Side margin stays full width below them
+            current_config['margin'] = st.number_input("Side Margin", 0, 100, get_state("margin", DEFAULT_MARGIN),
+                                                       key="margin")
+
+        with st.expander("Header & Footer Content", expanded=False):
+            st.caption("Decide where each element appears.")
+
+            def elem_row(label, key_pos, key_ord, def_pos, def_ord):
+                c1, c2 = st.columns([2, 1])
+                opts = ["Header", "Footer", "Hidden"]
+
+                curr_pos = get_state(key_pos, def_pos)
+                try:
+                    def_idx = opts.index(curr_pos)
+                except:
+                    def_idx = 2
+
+                pos = c1.selectbox(label, opts, index=def_idx, key=key_pos)
+                ord_val = c2.number_input("Order", value=get_state(key_ord, def_ord), key=key_ord)
+                return pos, ord_val
+
+            current_config['pos_title'], current_config['order_title'] = elem_row("Chapter Title", "pos_title",
+                                                                                  "ord_title", "Footer", 2)
+            current_config['pos_pagenum'], current_config['order_pagenum'] = elem_row("Page Number (X/Y)",
+                                                                                      "pos_pagenum", "ord_pagenum",
+                                                                                      "Footer", 1)
+            current_config['pos_chap_page'], current_config['order_chap_page'] = elem_row("Chapter Page (i/n)",
+                                                                                          "pos_chap", "ord_chap",
+                                                                                          "Hidden", 3)
+            current_config['pos_percent'], current_config['order_percent'] = elem_row("Reading %", "pos_perc",
+                                                                                      "ord_perc", "Hidden", 4)
+            st.divider()
+            st.markdown("#### Progress Bar Configuration")
+
+            prog_opts = ["Footer (Below Text)", "Footer (Above Text)", "Header (Below Text)", "Header (Above Text)",
+                         "Hidden"]
+            prog_curr = get_state("pos_progress", "Footer (Below Text)")
+            try:
+                prog_idx = prog_opts.index(prog_curr)
+            except:
+                prog_idx = 0
+
+            current_config['pos_progress'] = st.selectbox("Position", prog_opts, index=prog_idx, key="pos_progress")
+
+            st.caption("Dimensions")
+            p1, p2 = st.columns(2)
+            current_config['bar_height'] = p1.number_input("Bar Thickness", 1, 10, get_state("bar_height", 4),
+                                                           key="bar_height")
+            current_config['bar_tick_height'] = p2.number_input("Tick Height", 2, 20, get_state("bar_tick_height", 6),
+                                                                key="bar_tick_height")
+            st.caption("Marker")
+            p3, p4 = st.columns(2)
+            current_config['bar_marker_radius'] = p3.number_input("Marker Radius", 2, 10,
+                                                                  get_state("bar_marker_radius", 5),
+                                                                  key="bar_marker_radius")
+
+            mark_col_opts = ["Black", "White"]
+            mark_col_curr = get_state("bar_marker_color", "Black")
+            mark_col_idx = 0 if mark_col_curr == "Black" else 1
+            current_config['bar_marker_color'] = p4.selectbox("Marker Color", mark_col_opts, index=mark_col_idx,
+                                                              key="bar_marker_color")
+
+            st.caption("Visibility")
+            c_tick, c_mark = st.columns(2)
+            current_config['bar_show_ticks'] = c_tick.checkbox("Show Chapter Ticks",
+                                                               value=get_state("bar_show_ticks", True),
+                                                               key="bar_show_ticks")
+            current_config['bar_show_marker'] = c_mark.checkbox("Show Current Marker",
+                                                                value=get_state("bar_show_marker", True),
+                                                                key="bar_show_marker")
+
+        with st.expander("Header & Footer Styling", expanded=False):
+            st.subheader("Header Styling")
+            h1, h2 = st.columns(2)
+            current_config['header_font_size'] = h1.number_input("Font Size", 8, 30, get_state("header_font_size", 16),
+                                                                 key="header_font_size")
+
+            align_opts = ["Center", "Left", "Right", "Justify"]
+            h_align_curr = get_state("header_align", "Center")
+            h_idx = align_opts.index(h_align_curr) if h_align_curr in align_opts else 0
+
+            current_config['header_align'] = h2.selectbox("Alignment", align_opts, index=h_idx, key="header_align")
+            current_config['header_margin'] = st.number_input("Header Y-Offset", 0, 100, get_state("header_margin", 10),
+                                                              key="header_margin")
+            st.divider()
+            st.subheader("Footer Styling")
+            f1, f2 = st.columns(2)
+            current_config['footer_font_size'] = f1.number_input("Font Size ", 8, 30, get_state("footer_font_size", 16),
+                                                                 key="footer_font_size")
+
+            f_align_curr = get_state("footer_align", "Center")
+            f_idx = align_opts.index(f_align_curr) if f_align_curr in align_opts else 0
+
+            current_config['footer_align'] = f2.selectbox("Alignment ", align_opts, index=f_idx, key="footer_align")
+            current_config['footer_margin'] = st.number_input("Footer Y-Offset", 0, 100, get_state("footer_margin", 10),
+                                                              key="footer_margin")
+
         st.divider()
-        st.subheader("Footer Settings")
-        current_config['footer_visible'] = st.checkbox("Show Footer Area", value=True, key="footer_visible")
-
-        if current_config['footer_visible']:
-            f_col1, f_col2 = st.columns(2)
-
-            with f_col1:
-                st.caption("Content")
-                current_config['footer_show_progress'] = st.checkbox("Progress Bar", value=True,
-                                                                     key="footer_show_progress")
-                current_config['footer_show_pagenum'] = st.checkbox("Page Numbers", value=True,
-                                                                    key="footer_show_pagenum")
-                current_config['footer_show_title'] = st.checkbox("Chapter Title", value=True, key="footer_show_title")
-                current_config['footer_text_pos'] = st.selectbox("Text Position", ["Text Above Bar", "Text Below Bar"],
-                                                                 key="footer_text_pos")
-
-            with f_col2:
-                st.caption("Style")
-                current_config['footer_font_size'] = st.number_input("Text Size", 10, 24, 16, key="footer_font_size")
-                current_config['footer_bar_height'] = st.number_input("Bar Thickness", 1, 10, 4,
-                                                                      key="footer_bar_height")
-                # LABEL RENAMED HERE
-                current_config['footer_bottom_margin'] = st.number_input("Footer Position", 0, 100, 10,
-                                                                         key="footer_bottom_margin")
-        else:
-            # Default hidden values if footer is off (to keep consistent state if toggled back)
-            current_config['footer_show_progress'] = st.session_state.get('footer_show_progress', True)
-            current_config['footer_show_pagenum'] = st.session_state.get('footer_show_pagenum', True)
-            current_config['footer_show_title'] = st.session_state.get('footer_show_title', True)
-            current_config['footer_text_pos'] = st.session_state.get('footer_text_pos', "Text Above Bar")
-            current_config['footer_font_size'] = st.session_state.get('footer_font_size', 16)
-            current_config['footer_bar_height'] = st.session_state.get('footer_bar_height', 4)
-            current_config['footer_bottom_margin'] = st.session_state.get('footer_bottom_margin', 10)
-
-        st.divider()
-        st.header("3. View")
-        preview_width = st.slider("Preview Zoom", 200, 800, 350)
-
         if st.session_state.processor.is_parsed:
-            if st.button("Apply Changes / Render", type="primary"):
+            if st.button("Apply Changes / Render", type="primary", use_container_width=True):
                 st.session_state.force_render = True
 
     # --- MAIN RENDER LOGIC ---
-
     font_path = ""
     if uploaded_font:
         try:
@@ -728,33 +1082,15 @@ def main():
             pass
 
     current_config['selected_indices_tuple'] = tuple(sorted(st.session_state.selected_chapter_indices))
-
-    should_render = (
-            st.session_state.processor.is_parsed
-            and (
-                    current_config != st.session_state.last_config
-                    or not st.session_state.processor.is_ready
-                    or st.session_state.get('force_render', False)
-            )
-    )
+    should_render = (st.session_state.processor.is_parsed and (
+            current_config != st.session_state.last_config or not st.session_state.processor.is_ready or st.session_state.get(
+        'force_render', False)))
 
     if should_render:
         st.session_state.force_render = False
         relative_pos = 0.0
         if st.session_state.processor.is_ready and st.session_state.processor.total_pages > 0:
             relative_pos = st.session_state.current_page / st.session_state.processor.total_pages
-
-        # Build Footer Settings Dict
-        footer_settings = {
-            "footer_visible": current_config['footer_visible'],
-            "footer_font_size": current_config['footer_font_size'],
-            "footer_show_progress": current_config['footer_show_progress'],
-            "footer_show_pagenum": current_config['footer_show_pagenum'],
-            "footer_show_title": current_config['footer_show_title'],
-            "footer_text_pos": current_config['footer_text_pos'],
-            "footer_bar_height": current_config['footer_bar_height'],
-            "footer_bottom_margin": current_config['footer_bottom_margin']
-        }
 
         with st.spinner("Rendering layout... (Step 2/2)"):
             success = st.session_state.processor.render_chapters(
@@ -769,9 +1105,9 @@ def main():
                 current_config['align'],
                 current_config['orientation'],
                 current_config['use_toc'],
-                footer_settings=footer_settings
+                layout_settings=current_config,
+                show_footnotes=current_config['show_footnotes']
             )
-
             if success:
                 st.session_state.last_config = current_config
                 new_total = st.session_state.processor.total_pages
@@ -780,31 +1116,27 @@ def main():
                 st.rerun()
 
     # --- DISPLAY AREA ---
-
     if st.session_state.processor.is_ready:
-
-        # 1. Top Nav
         c1, c2, c3 = st.columns([1, 2, 1])
         with c1:
             if st.button("⬅ Previous", use_container_width=True):
                 st.session_state.current_page = max(0, st.session_state.current_page - 1)
         with c2:
-            st.markdown(
-                f"""<div style="text-align:center; padding-top: 5px; font-size:1.1rem; color: #444;">
+            st.markdown(f"""<div style="text-align:center; padding-top: 5px; font-size:1.1rem; color: #444;">
                     Page <b>{st.session_state.current_page + 1}</b> / {st.session_state.processor.total_pages}
-                </div>""", unsafe_allow_html=True
-            )
+                </div>""", unsafe_allow_html=True)
         with c3:
             if st.button("Next ➡", use_container_width=True):
-                st.session_state.current_page = min(
-                    st.session_state.processor.total_pages - 1, st.session_state.current_page + 1
-                )
+                st.session_state.current_page = min(st.session_state.processor.total_pages - 1,
+                                                    st.session_state.current_page + 1)
 
-        # 2. Render Image
+        # Main Preview Image
         img = st.session_state.processor.render_page(st.session_state.current_page)
 
-        # Smart Scaling for Preview
-        base_size = int(preview_width)
+        # Pull zoom value from session state slider (below) or default
+        preview_width_val = st.session_state.get("preview_zoom_slider", 350)
+
+        base_size = int(preview_width_val)
         if img.width > img.height:
             target_h = base_size
             target_w = int(target_h * (img.width / img.height))
@@ -820,14 +1152,13 @@ def main():
             preview_img.save(buffer, format="PNG")
             img_b64 = base64.b64encode(buffer.getvalue()).decode()
 
-        st.markdown(
-            f"""<div style="display: flex; justify-content: center; margin-top: 15px;">
+        st.markdown(f"""<div style="display: flex; justify-content: center; margin-top: 15px;">
                 <img src="data:image/png;base64,{img_b64}" width="{target_w}" style="max-width: 100%; box-shadow: 0px 4px 15px rgba(0,0,0,0.15);">
-            </div>""", unsafe_allow_html=True
-        )
+            </div>""", unsafe_allow_html=True)
 
-        # 3. Bottom Nav (Go To Page)
-        st.divider()
+        # Moved Preview Slider here (Below Image)
+        st.columns([1, 2, 1])[1].slider("Preview Zoom", 200, 800, 350, key="preview_zoom_slider")
+
         b1, b2, b3 = st.columns([5, 2, 5])
         with b2:
             def update_page():
@@ -835,15 +1166,8 @@ def main():
                 if 0 < val <= st.session_state.processor.total_pages:
                     st.session_state.current_page = val - 1
 
-            st.number_input(
-                "Jump to page:",
-                min_value=1,
-                max_value=st.session_state.processor.total_pages,
-                value=st.session_state.current_page + 1,
-                key="goto_input",
-                on_change=update_page
-            )
-
+            st.number_input("Jump to page:", min_value=1, max_value=st.session_state.processor.total_pages,
+                            value=st.session_state.current_page + 1, key="goto_input", on_change=update_page)
     else:
         st.info("👈 Please upload an EPUB file in the sidebar to begin.")
 
