@@ -12,6 +12,8 @@ import re
 import tempfile
 import io
 import json
+import zipfile
+import shutil
 from urllib.parse import unquote
 
 # --- CONFIGURATION DEFAULTS ---
@@ -25,27 +27,124 @@ DEFAULT_FONT_WEIGHT = 400
 DEFAULT_BOTTOM_PADDING = 45
 DEFAULT_TOP_PADDING = 15
 
+# --- SYSTEM FONTS (FITZ / BASE-14) ---
+# Organized by category. These are built into the PDF engine.
+FITZ_FONTS = {
+    "--- SERIF (Book Standard) ---": "Times-Roman",
+    "Serif: Times Roman": "Times-Roman",
+    "Serif: Times Bold (High Contrast)": "Times-Bold",
+    "Serif: Generic": "serif",
+
+    "--- SANS-SERIF (Clean/Modern) ---": "Helvetica",
+    "Sans: Helvetica": "Helvetica",
+    "Sans: Helvetica Bold (High Contrast)": "Helvetica-Bold",
+    "Sans: Generic": "sans-serif",
+
+    "--- MONOSPACE (Typewriter) ---": "Courier",
+    "Mono: Courier": "Courier",
+    "Mono: Courier Bold": "Courier-Bold",
+    "Mono: Generic": "monospace",
+}
+
 
 # --- UTILITY FUNCTIONS ---
 
 def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
     if target_font_family is None:
         return css_text
+    # Replace existing font definitions with our target
     css_text = re.sub(r'font-family\s*:\s*[^;!]+', f'font-family: {target_font_family}', css_text)
     return css_text
 
 
-def get_pil_font(font_path, size):
-    # 1. Try Custom Uploaded Font
-    if font_path and os.path.exists(font_path):
+def get_font_variants(directory):
+    """
+    Scans a directory for font files and assigns them to Regular, Bold, Italic, BoldItalic
+    based on filename keywords.
+    """
+    try:
+        all_files = [f for f in os.listdir(directory) if f.lower().endswith((".ttf", ".otf"))]
+    except:
+        return {}
+
+    candidates = {
+        "regular": [],
+        "italic": [],
+        "bold": [],
+        "bold_italic": []
+    }
+
+    for f in all_files:
+        full_path = os.path.join(directory, f).replace("\\", "/")
+        name_lower = f.lower()
+
+        # Keywords
+        has_bold = any(x in name_lower for x in ["bold", "bd"])
+        has_italic = any(x in name_lower for x in ["italic", "oblique", "obl"])
+
+        if has_bold and has_italic:
+            candidates["bold_italic"].append(full_path)
+        elif has_bold:
+            candidates["bold"].append(full_path)
+        elif has_italic:
+            candidates["italic"].append(full_path)
+        else:
+            candidates["regular"].append(full_path)
+
+    def pick_best(file_list):
+        if not file_list: return None
+        return sorted(file_list, key=len)[0]
+
+    results = {
+        "regular": pick_best(candidates["regular"]),
+        "italic": pick_best(candidates["italic"]),
+        "bold": pick_best(candidates["bold"]),
+        "bold_italic": pick_best(candidates["bold_italic"])
+    }
+
+    if not results["regular"] and all_files:
+        results["regular"] = os.path.join(directory, all_files[0]).replace("\\", "/")
+
+    return results
+
+
+def get_pil_font(font_identifier, size):
+    """
+    Loads a Pillow ImageFont.
+    1. Checks if it's a file path.
+    2. Checks if it's a known system font name and tries to find a matching TTF.
+    """
+    # 1. Is it a path that exists? (Custom Upload)
+    if font_identifier and os.path.exists(font_identifier):
         try:
-            return ImageFont.truetype(font_path, size)
+            return ImageFont.truetype(font_identifier, size)
         except:
             pass
 
-    # 2. Try Default "Georgia" (System Font)
-    # Tries common filenames/names. Note: This requires Georgia to be installed on the system.
-    for font_name in ["Georgia", "Georgia.ttf", "georgia.ttf"]:
+    # 2. System Font Mapping (Best Effort for Headers/Footers)
+    # We try to map the Fitz name (e.g., "Helvetica-Bold") to a likely system TTF.
+    # This is only for the UI elements (page numbers, etc.), the book body uses Fitz internal.
+
+    is_bold = "Bold" in str(font_identifier) or "bd" in str(font_identifier).lower()
+    is_serif = "Times" in str(font_identifier) or "serif" in str(font_identifier).lower()
+    is_mono = "Courier" in str(font_identifier) or "mono" in str(font_identifier).lower()
+
+    candidates = []
+
+    if is_mono:
+        candidates = ["Courier New.ttf", "consola.ttf", "cour.ttf"]
+        if is_bold: candidates = ["courbd.ttf", "consolab.ttf"] + candidates
+    elif is_serif:
+        candidates = ["Times New Roman.ttf", "times.ttf", "Georgia.ttf"]
+        if is_bold: candidates = ["timesbd.ttf", "georgiab.ttf"] + candidates
+    else:  # Sans is default
+        candidates = ["Arial.ttf", "Helvetica.ttf", "Verdana.ttf"]
+        if is_bold: candidates = ["arialbd.ttf", "verdanab.ttf"] + candidates
+
+    # Generic fallbacks
+    candidates.extend(["DejaVuSans.ttf", "FreeSans.ttf", "Arial.ttf", "arial.ttf"])
+
+    for font_name in candidates:
         try:
             return ImageFont.truetype(font_name, size)
         except:
@@ -145,6 +244,10 @@ class EpubProcessor:
 
         # Layout Settings
         self.layout_settings = {}
+
+        # Font Data
+        self.font_data = {}
+        self.ui_font_ref = None
 
     # --- FOOTNOTE & CONTENT EXTRACTION HELPERS ---
     def _smart_extract_content(self, elem):
@@ -536,10 +639,21 @@ class EpubProcessor:
         return [(x[1], x[2]) for x in active]
 
     # --- STEP 2: RENDER (SLOW) ---
-    def render_chapters(self, selected_indices_set, font_path, font_size, margin, line_height, font_weight,
+    def render_chapters(self, selected_indices_set, font_data_input, font_size, margin, line_height, font_weight,
                         bottom_padding, top_padding, text_align, orientation, add_toc, layout_settings=None,
                         show_footnotes=True):
-        self.font_path = font_path
+
+        # --- FONT LOGIC ---
+        is_custom_font = isinstance(font_data_input, dict)
+
+        if is_custom_font:
+            self.font_data = font_data_input
+            self.ui_font_ref = font_data_input.get("regular")
+        else:
+            # It's a system font name string
+            self.font_data = font_data_input
+            self.ui_font_ref = font_data_input  # Pass string to pillow loader
+
         self.font_size = int(font_size)
         self.margin = margin
         self.line_height = line_height
@@ -559,18 +673,47 @@ class EpubProcessor:
         for doc, _ in self.fitz_docs: doc.close()
         self.fitz_docs, self.page_map = [], []
 
-        if self.font_path and os.path.exists(self.font_path):
-            css_font_path = self.font_path.replace("\\", "/")
-            font_face_rule = f'@font-face {{ font-family: "CustomFont"; src: url("{css_font_path}"); }}'
+        # --- CSS Font Generation ---
+        font_rules = []
+        font_family_val = "serif"  # Default fallback
+
+        if is_custom_font:
+            # Generate @font-face rules for local files
+            def add_font_rule(path, weight="normal", style="normal"):
+                if path and os.path.exists(path):
+                    css_path = path.replace("\\", "/")
+                    return f"""@font-face {{ 
+                        font-family: "CustomFont"; 
+                        src: url("{css_path}"); 
+                        font-weight: {weight}; 
+                        font-style: {style}; 
+                    }}"""
+                return ""
+
+            if self.font_data.get("regular"):
+                font_rules.append(add_font_rule(self.font_data["regular"], "normal", "normal"))
+            if self.font_data.get("bold"):
+                font_rules.append(add_font_rule(self.font_data["bold"], "bold", "normal"))
+            if self.font_data.get("italic"):
+                font_rules.append(add_font_rule(self.font_data["italic"], "normal", "italic"))
+            if self.font_data.get("bold_italic"):
+                font_rules.append(add_font_rule(self.font_data["bold_italic"], "bold", "italic"))
+
             font_family_val = '"CustomFont"'
         else:
-            font_face_rule = ""
-            font_family_val = "serif"
+            # Use System Font Name
+            # If it's a generic family (lowercase), don't quote it
+            if self.font_data in ["serif", "sans-serif", "monospace", "cursive", "fantasy"]:
+                font_family_val = self.font_data
+            else:
+                font_family_val = f'"{self.font_data}"'
+
+        font_face_block = "\n".join(font_rules)
 
         patched_css = fix_css_font_paths(self.book_css, font_family_val)
         custom_css = f"""
         <style>
-            {font_face_rule}
+            {font_face_block}
             @page {{ size: {self.screen_width}pt {self.screen_height}pt; margin: 0; }}
             body, p, div, span, li, blockquote, dd, dt {{
                 font-family: {font_family_val} !important;
@@ -647,8 +790,8 @@ class EpubProcessor:
         return True
 
     def _get_ui_font(self, size):
-        # Pass the path (even if None) so get_pil_font can handle the Georgia fallback
-        return get_pil_font(self.font_path, int(size))
+        # We pass self.ui_font_ref to Pillow
+        return get_pil_font(self.ui_font_ref, int(size))
 
     def _render_toc_pages(self, toc_entries):
         pages = []
@@ -748,8 +891,6 @@ class EpubProcessor:
 
 # --- STREAMLIT APP ---
 
-# HELPER: MAPPING DICTIONARY FOR COMPATIBILITY
-# Streamlit Widget Key -> CTK JSON Key
 KEY_MAP = {
     "top_pad": "top_padding",
     "bot_pad": "bottom_padding",
@@ -791,11 +932,8 @@ def get_current_settings_for_export():
     for st_key, ctk_key in KEY_MAP.items():
         if st_key in st.session_state:
             export_data[ctk_key] = st.session_state[st_key]
-
-    # Defaults for anything missing from session state
     if "font_name" not in export_data: export_data["font_name"] = "Default (System)"
     if "preview_zoom" not in export_data: export_data["preview_zoom"] = 300
-
     return json.dumps(export_data, indent=4)
 
 
@@ -822,24 +960,17 @@ def main():
 
     # --- SIDEBAR ---
     with st.sidebar:
-        # --- PRESETS SECTION (Moved to Top for visibility) ---
         with st.expander("Presets (Save/Load)", expanded=False):
-            # 1. LOAD SECTION
             uploaded_preset = st.file_uploader("Load Preset (JSON)", type=["json"])
-
             if uploaded_preset:
                 preset_id = f"{uploaded_preset.name}_{uploaded_preset.size}"
                 if st.session_state.get('applied_preset_id') != preset_id:
                     try:
                         loaded_data = json.load(uploaded_preset)
-
-                        # Reverse Map: CTK Key -> Streamlit Key
                         REVERSE_MAP = {v: k for k, v in KEY_MAP.items()}
-
                         for k, v in loaded_data.items():
                             target_key = REVERSE_MAP.get(k, k)
                             st.session_state[target_key] = v
-
                         st.session_state['applied_preset_id'] = preset_id
                         st.success("Preset applied!")
                         st.rerun()
@@ -848,8 +979,6 @@ def main():
             elif 'applied_preset_id' in st.session_state:
                 del st.session_state['applied_preset_id']
 
-            # 2. SAVE SECTION (Cross-Compatible with CTK)
-            # Use callback to generate JSON right when button is clicked
             st.download_button(
                 label="💾 Download Current Preset",
                 data=get_current_settings_for_export(),
@@ -868,7 +997,14 @@ def main():
                 if st.button("Download XTC", type="primary", use_container_width=True):
                     with st.spinner("Generating..."):
                         xtc_data = st.session_state.processor.get_xtc_bytes()
-                        st.download_button("Save XTC", data=xtc_data, file_name="book.xtc",
+
+                        # 1. Get original name, strip extension, add .xtc
+                        original_name = st.session_state.file_key.rsplit('_', 1)[0]  # Removes the _size suffix we added
+                        base_name = os.path.splitext(original_name)[0]
+                        out_name = f"{base_name}.xtc"
+
+                        # 2. Pass out_name to file_name
+                        st.download_button("Save XTC", data=xtc_data, file_name=out_name,
                                            mime="application/octet-stream")
             with col_cov:
                 with st.popover("Export Cover", use_container_width=True):
@@ -898,7 +1034,31 @@ def main():
 
         st.header("1. Input")
         uploaded_file = st.file_uploader("Upload EPUB", type=["epub"])
-        uploaded_font = st.file_uploader("Custom Font (TTF)", type=["ttf"])
+
+        # --- NEW FONT SELECTION UI ---
+        font_mode = st.radio("Font Source", ["System (Built-in)", "Custom (Upload)"], horizontal=True)
+
+        final_font_data = None
+        uploaded_font_zip = None
+
+        if font_mode == "Custom (Upload)":
+            uploaded_font_zip = st.file_uploader("Custom Font Family (ZIP)", type=["zip"],
+                                                 help="Upload a ZIP file containing TTF or OTF files.")
+        else:
+            # System font selection
+            # Sort keys so headers appear first, but separators are handled
+            display_keys = list(FITZ_FONTS.keys())
+            selected_sys_font = st.selectbox("Select System Font", display_keys, index=1)  # Default to Times Roman
+
+            # Handle headers/separators selection gracefully
+            if "---" in selected_sys_font:
+                st.warning("Please select a valid font, not a category header.")
+                final_font_data = "Times-Roman"
+            else:
+                final_font_data = FITZ_FONTS[selected_sys_font]
+
+            current_config['font_source'] = "system"
+            current_config['system_font_name'] = final_font_data
 
         if uploaded_file:
             file_key = f"{uploaded_file.name}_{uploaded_file.size}"
@@ -920,11 +1080,23 @@ def main():
         if st.session_state.processor.is_parsed:
             with st.expander("Chapter Visibility (TOC)", expanded=False):
                 st.info("Unchecked chapters are hidden from navigation but remain in book.")
-                all_titles = [f"{i + 1}. {c['title']}" for i, c in enumerate(st.session_state.processor.raw_chapters)]
-                selected_titles = st.multiselect("Include in Navigation:", all_titles, default=all_titles)
-                st.session_state.selected_chapter_indices = [all_titles.index(t) for t in selected_titles]
 
-        # Use Session State to persist defaults
+                selected_indices = []
+                for idx, chapter in enumerate(st.session_state.processor.raw_chapters):
+                    title = chapter['title']
+
+                    # Default Rule: If title starts with "Section ", default to False (Unchecked)
+                    # We use the file_key in the widget key to ensure it resets when you upload a new book
+                    is_auto_section = title.strip().startswith("Section ")
+                    default_val = not is_auto_section
+                    widget_key = f"toc_cb_{st.session_state.file_key}_{idx}"
+
+                    # Render Checkbox
+                    if st.checkbox(f"{idx + 1}. {title}", value=default_val, key=widget_key):
+                        selected_indices.append(idx)
+
+                st.session_state.selected_chapter_indices = selected_indices
+
         def get_state(key, default):
             if key not in st.session_state:
                 st.session_state[key] = default
@@ -955,9 +1127,7 @@ def main():
                                                             key="line_height")
             st.subheader("Margins & Padding")
 
-            # Create two side-by-side columns for the padding inputs
             pad_col1, pad_col2 = st.columns(2)
-
             with pad_col1:
                 current_config['top_pad'] = st.number_input("Top Padding", 0, 150,
                                                             get_state("top_pad", DEFAULT_TOP_PADDING), key="top_pad")
@@ -967,7 +1137,6 @@ def main():
                                                             get_state("bot_pad", DEFAULT_BOTTOM_PADDING),
                                                             key="bot_pad")
 
-            # Side margin stays full width below them
             current_config['margin'] = st.number_input("Side Margin", 0, 100, get_state("margin", DEFAULT_MARGIN),
                                                        key="margin")
 
@@ -977,13 +1146,11 @@ def main():
             def elem_row(label, key_pos, key_ord, def_pos, def_ord):
                 c1, c2 = st.columns([2, 1])
                 opts = ["Header", "Footer", "Hidden"]
-
                 curr_pos = get_state(key_pos, def_pos)
                 try:
                     def_idx = opts.index(curr_pos)
                 except:
                     def_idx = 2
-
                 pos = c1.selectbox(label, opts, index=def_idx, key=key_pos)
                 ord_val = c2.number_input("Order", value=get_state(key_ord, def_ord), key=key_ord)
                 return pos, ord_val
@@ -1070,16 +1237,37 @@ def main():
                 st.session_state.force_render = True
 
     # --- MAIN RENDER LOGIC ---
-    font_path = ""
-    if uploaded_font:
+
+    # Process Font Upload if in Custom Mode
+    if font_mode == "Custom (Upload)" and uploaded_font_zip:
+        font_temp_dir = os.path.join(tempfile.gettempdir(), "epub_xtc_fonts")
+        if os.path.exists(font_temp_dir):
+            try:
+                shutil.rmtree(font_temp_dir)
+            except:
+                pass
+        os.makedirs(font_temp_dir, exist_ok=True)
+
         try:
-            tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".ttf")
-            tfile.write(uploaded_font.getvalue())
-            font_path = tfile.name
-            tfile.close()
-            current_config['font_sig'] = uploaded_font.name
-        except:
-            pass
+            with zipfile.ZipFile(uploaded_font_zip) as z:
+                z.extractall(font_temp_dir)
+
+            # Use helper to scan directory
+            scanned_fonts = get_font_variants(font_temp_dir)
+
+            if scanned_fonts.get("regular"):
+                final_font_data = scanned_fonts  # Assign DICT to variable
+                current_config['font_source'] = "custom"
+                current_config['font_sig'] = uploaded_font_zip.name
+                st.success(f"Font loaded! Variants found: {[k for k, v in scanned_fonts.items() if v]}")
+            else:
+                st.warning("No font files found in ZIP.")
+        except Exception as e:
+            st.error(f"Failed to process font ZIP: {e}")
+
+    # Fallback to default system font if nothing selected/uploaded
+    if final_font_data is None:
+        final_font_data = "Times-Roman"  # Default Fallback
 
     current_config['selected_indices_tuple'] = tuple(sorted(st.session_state.selected_chapter_indices))
     should_render = (st.session_state.processor.is_parsed and (
@@ -1095,7 +1283,7 @@ def main():
         with st.spinner("Rendering layout... (Step 2/2)"):
             success = st.session_state.processor.render_chapters(
                 set(st.session_state.selected_chapter_indices),
-                font_path,
+                final_font_data,  # Can be Dict or String now
                 current_config['font_size'],
                 current_config['margin'],
                 current_config['line_height'],
@@ -1145,9 +1333,6 @@ def main():
             target_h = int(target_w * (img.height / img.width))
 
         preview_img = img.copy().resize((target_w, target_h), Image.Resampling.LANCZOS)
-        draw = ImageDraw.Draw(preview_img)
-        draw.rectangle([(0, 0), (target_w - 1, target_h - 1)], outline="black", width=2)
-
         with io.BytesIO() as buffer:
             preview_img.save(buffer, format="PNG")
             img_b64 = base64.b64encode(buffer.getvalue()).decode()
@@ -1156,7 +1341,6 @@ def main():
                 <img src="data:image/png;base64,{img_b64}" width="{target_w}" style="max-width: 100%; box-shadow: 0px 4px 15px rgba(0,0,0,0.15);">
             </div>""", unsafe_allow_html=True)
 
-        # Moved Preview Slider here (Below Image)
         st.columns([1, 2, 1])[1].slider("Preview Zoom", 200, 800, 350, key="preview_zoom_slider")
 
         b1, b2, b3 = st.columns([5, 2, 5])
