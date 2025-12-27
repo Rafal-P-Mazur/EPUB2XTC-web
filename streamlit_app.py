@@ -2,7 +2,7 @@ import streamlit as st
 import os
 import struct
 import fitz  # PyMuPDF
-from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageEnhance, ImageDraw, ImageFont, ImageOps, ImageFilter
 import ebooklib
 from ebooklib import epub
 from bs4 import BeautifulSoup, NavigableString
@@ -26,9 +26,10 @@ DEFAULT_LINE_HEIGHT = 1.4
 DEFAULT_FONT_WEIGHT = 400
 DEFAULT_BOTTOM_PADDING = 45
 DEFAULT_TOP_PADDING = 15
+DEFAULT_TEXT_THRESHOLD = 130
+DEFAULT_TEXT_BLUR = 0.7
 
 # --- SYSTEM FONTS (FITZ / BASE-14) ---
-# Organized by category. These are built into the PDF engine.
 FITZ_FONTS = {
     "--- SERIF (Book Standard) ---": "Times-Roman",
     "Serif: Times Roman": "Times-Roman",
@@ -52,16 +53,11 @@ FITZ_FONTS = {
 def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
     if target_font_family is None:
         return css_text
-    # Replace existing font definitions with our target
     css_text = re.sub(r'font-family\s*:\s*[^;!]+', f'font-family: {target_font_family}', css_text)
     return css_text
 
 
 def get_font_variants(directory):
-    """
-    Scans a directory for font files and assigns them to Regular, Bold, Italic, BoldItalic
-    based on filename keywords.
-    """
     try:
         all_files = [f for f in os.listdir(directory) if f.lower().endswith((".ttf", ".otf"))]
     except:
@@ -78,7 +74,6 @@ def get_font_variants(directory):
         full_path = os.path.join(directory, f).replace("\\", "/")
         name_lower = f.lower()
 
-        # Keywords
         has_bold = any(x in name_lower for x in ["bold", "bd"])
         has_italic = any(x in name_lower for x in ["italic", "oblique", "obl"])
 
@@ -109,21 +104,11 @@ def get_font_variants(directory):
 
 
 def get_pil_font(font_identifier, size):
-    """
-    Loads a Pillow ImageFont.
-    1. Checks if it's a file path.
-    2. Checks if it's a known system font name and tries to find a matching TTF.
-    """
-    # 1. Is it a path that exists? (Custom Upload)
     if font_identifier and os.path.exists(font_identifier):
         try:
             return ImageFont.truetype(font_identifier, size)
         except:
             pass
-
-    # 2. System Font Mapping (Best Effort for Headers/Footers)
-    # We try to map the Fitz name (e.g., "Helvetica-Bold") to a likely system TTF.
-    # This is only for the UI elements (page numbers, etc.), the book body uses Fitz internal.
 
     is_bold = "Bold" in str(font_identifier) or "bd" in str(font_identifier).lower()
     is_serif = "Times" in str(font_identifier) or "serif" in str(font_identifier).lower()
@@ -137,11 +122,10 @@ def get_pil_font(font_identifier, size):
     elif is_serif:
         candidates = ["Times New Roman.ttf", "times.ttf", "Georgia.ttf"]
         if is_bold: candidates = ["timesbd.ttf", "georgiab.ttf"] + candidates
-    else:  # Sans is default
+    else:
         candidates = ["Arial.ttf", "Helvetica.ttf", "Verdana.ttf"]
         if is_bold: candidates = ["arialbd.ttf", "verdanab.ttf"] + candidates
 
-    # Generic fallbacks
     candidates.extend(["DejaVuSans.ttf", "FreeSans.ttf", "Arial.ttf", "arial.ttf"])
 
     for font_name in candidates:
@@ -150,7 +134,6 @@ def get_pil_font(font_identifier, size):
         except:
             continue
 
-    # 3. Last Resort Fallback
     return ImageFont.load_default()
 
 
@@ -177,21 +160,50 @@ def extract_images_to_base64(book):
 
 
 def get_official_toc_mapping(book):
+    """
+    Returns a mapping of {filename: [(anchor, title), ...]}
+    """
     mapping = {}
 
+    def add_entry(href, title):
+        if '#' in href:
+            href_clean, anchor = href.split('#', 1)
+        else:
+            href_clean, anchor = href, None
+
+        filename = os.path.basename(href_clean)
+
+        if filename not in mapping:
+            mapping[filename] = []
+
+        mapping[filename].append((anchor, title))
+
+    # 1. Try Standard TOC
     def process_toc_item(item):
         if isinstance(item, tuple):
             if len(item) > 1 and isinstance(item[1], list):
                 for sub in item[1]: process_toc_item(sub)
         elif isinstance(item, epub.Link):
-            clean_href = item.href.split('#')[0]
-            filename = os.path.basename(clean_href)
-            if filename not in mapping:
-                mapping[filename] = item.title
+            add_entry(item.href, item.title)
 
-    for item in book.toc: process_toc_item(item)
+    for item in book.toc:
+        process_toc_item(item)
+
+    # 2. Fallback to Nav Document if empty
+    if not mapping:
+        nav_item = next((item for item in book.get_items()
+                         if item.get_type() == ebooklib.ITEM_NAVIGATION), None)
+        if nav_item:
+            try:
+                soup = BeautifulSoup(nav_item.get_content(), 'html.parser')
+                nav_element = soup.find('nav', attrs={'epub:type': 'toc'}) or soup.find('nav')
+                if nav_element:
+                    for link in nav_element.find_all('a', href=True):
+                        add_entry(link['href'], link.get_text().strip())
+            except:
+                pass
+
     return mapping
-
 
 def hyphenate_html_text(soup, language_code):
     try:
@@ -386,10 +398,59 @@ class EpubProcessor:
             return Image.open(io.BytesIO(item.get_content()))
         return None
 
+    def _split_html_by_toc(self, soup, toc_entries):
+        """
+        Splits a single BeautifulSoup object into multiple soup objects
+        based on the anchors provided in toc_entries.
+        """
+        chunks = []
+
+        # If the file has no anchors (just 1 chapter), return as is
+        if len(toc_entries) == 1 and not toc_entries[0][0]:
+            return [{'title': toc_entries[0][1], 'soup': soup}]
+
+        # 1. Locate all split points
+        split_points = []
+        for anchor, title in toc_entries:
+            target = None
+            if anchor:
+                target = soup.find(id=anchor)
+            if target or not anchor:
+                split_points.append({'node': target, 'title': title})
+
+        if not split_points:
+            return [{'title': toc_entries[0][1], 'soup': soup}]
+
+        # 2. Iterate and extract content
+        current_idx = 0
+        current_soup = BeautifulSoup("<body></body>", 'html.parser')
+        body_children = list(soup.body.children) if soup.body else []
+
+        for child in body_children:
+            if isinstance(child, NavigableString) and not child.strip():
+                if current_soup.body: current_soup.body.append(child.extract() if hasattr(child, 'extract') else child)
+                continue
+
+            if current_idx + 1 < len(split_points):
+                next_node = split_points[current_idx + 1]['node']
+                if next_node and (child == next_node or (hasattr(child, 'find') and next_node in child.find_all())):
+                    chunks.append({'title': split_points[current_idx]['title'], 'soup': current_soup})
+                    current_idx += 1
+                    current_soup = BeautifulSoup("<body></body>", 'html.parser')
+
+            if current_soup.body:
+                current_soup.body.append(child)
+
+        chunks.append({'title': split_points[current_idx]['title'], 'soup': current_soup})
+        return chunks
+
     # --- STEP 1: PARSE STRUCTURE (FAST) ---
     def parse_structure(self, epub_bytes):
         self.raw_chapters = []
         self.cover_image_obj = None
+
+        # Save bytes to temp file because EbookLib needs a file path usually,
+        # or we use BytesIO but your code used temp file strategy.
         epub_temp_path = os.path.join(self.temp_dir.name, "input.epub")
         with open(epub_temp_path, "wb") as f:
             f.write(epub_bytes)
@@ -399,10 +460,7 @@ class EpubProcessor:
         except Exception as e:
             return False, f"Error reading EPUB: {e}"
 
-        # Extract Cover
         self.cover_image_obj = self._find_cover_image(book)
-
-        # Build ID Map for Footnotes
         self.global_id_map = self._build_global_id_map(book)
 
         try:
@@ -412,38 +470,54 @@ class EpubProcessor:
 
         self.book_images = extract_images_to_base64(book)
         self.book_css = extract_all_css(book)
+
+        # NEW: Get the list-based mapping
         toc_mapping = get_official_toc_mapping(book)
 
         items = [book.get_item_with_id(item_ref[0]) for item_ref in book.spine
                  if isinstance(book.get_item_with_id(item_ref[0]), epub.EpubHtml)]
 
-        for idx, item in enumerate(items):
-            item_name = item.get_name()
-            item_filename = os.path.basename(item_name)
+        for item in items:
+            item_filename = os.path.basename(item.get_name())
             raw_html = item.get_content().decode('utf-8', errors='replace')
             soup = BeautifulSoup(raw_html, 'html.parser')
-            text_content = soup.get_text().strip()
             has_image = bool(soup.find('img'))
 
-            chapter_title = toc_mapping.get(item_filename)
-            if not chapter_title:
-                # Fallback Title logic
-                for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
-                    header = soup.find(tag)
-                    if header:
-                        t = header.get_text().strip()
-                        if t and len(t) < 150:
-                            chapter_title = t
-                            break
-                if not chapter_title:
-                    chapter_title = f"Section {len(self.raw_chapters) + 1}"
+            # Check if this file maps to TOC entries
+            toc_entries = toc_mapping.get(item_filename)
 
-            self.raw_chapters.append({
-                'title': chapter_title,
-                'soup': soup,
-                'has_image': has_image,
-                'filename': item_filename
-            })
+            if toc_entries and len(toc_entries) > 1:
+                # SPLIT MODE: File contains multiple chapters
+                split_chapters = self._split_html_by_toc(soup, toc_entries)
+                for chunk in split_chapters:
+                    self.raw_chapters.append({
+                        'title': chunk['title'],
+                        'soup': chunk['soup'],
+                        'has_image': bool(chunk['soup'].find('img')),
+                        'filename': item_filename
+                    })
+            else:
+                # STANDARD MODE: 1 File = 1 Chapter
+                chapter_title = toc_entries[0][1] if toc_entries else None
+
+                # Fallback Title logic
+                if not chapter_title:
+                    for tag in ['h1', 'h2', 'h3', 'h4', 'h5', 'h6']:
+                        header = soup.find(tag)
+                        if header:
+                            t = header.get_text().strip()
+                            if t and len(t) < 150:
+                                chapter_title = t
+                                break
+                    if not chapter_title:
+                        chapter_title = f"Section {len(self.raw_chapters) + 1}"
+
+                self.raw_chapters.append({
+                    'title': chapter_title,
+                    'soup': soup,
+                    'has_image': has_image,
+                    'filename': item_filename
+                })
 
         self.is_parsed = True
         return True, "Success"
@@ -839,37 +913,90 @@ class EpubProcessor:
 
     def render_page(self, global_page_index):
         if not self.is_ready: return None
+
+        # 1. GET SETTINGS
+        threshold_val = self.layout_settings.get("text_threshold", 160)
+        blur_val = self.layout_settings.get("text_blur", 0.7)
+        mode = "Auto"  # HARDCODED
+
         num_toc = len(self.toc_pages_images)
         footer_padding = max(0, self.bottom_padding)
         header_padding = max(0, self.top_padding)
         content_height = self.screen_height - footer_padding - header_padding
+
+        # --- STEP A: PREPARE CONTENT LAYER (The part we might blur) ---
         if global_page_index < num_toc:
-            img = self.toc_pages_images[global_page_index].copy().convert("RGB")
+            # TOC is treated as "Interface" - NO BLUR needed usually
+            # But since it's an image, we convert it to L
+            img_content = self.toc_pages_images[global_page_index].copy().convert("L")
+            is_toc = True
+            has_image_content = False
         else:
+            is_toc = False
             doc_idx, page_idx = self.page_map[global_page_index - num_toc]
-            doc, has_image = self.fitz_docs[doc_idx]
+            doc, has_image_content = self.fitz_docs[doc_idx]
             page = doc[page_idx]
+
+            # Render High Quality
             mat = fitz.Matrix(DEFAULT_RENDER_SCALE, DEFAULT_RENDER_SCALE)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            img_content = img_content.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert("L")
-            img = Image.new("RGB", (self.screen_width, self.screen_height), (255, 255, 255))
-            img.paste(img_content, (0, header_padding))
-            if has_image:
-                img = img.convert("L")
-                img = ImageEnhance.Contrast(ImageEnhance.Brightness(img).enhance(1.15)).enhance(1.4)
-                img = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+
+            # Create the body content image
+            img_content_raw = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            img_content = img_content_raw.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert(
+                "L")
+
+        # --- STEP B: APPLY FILTERS TO BODY CONTENT ONLY ---
+        # We only blur/threshold the book text, not the headers/footers
+
+        should_dither = False
+        if mode == "Image (Dither)":
+            should_dither = True
+        elif mode == "Text Only (Sharp)":
+            should_dither = False
+        else:
+            should_dither = has_image_content
+
+        # Create a canvas for the full page
+        full_page = Image.new("L", (self.screen_width, self.screen_height), 255)
+
+        # Paste content into place
+        paste_y = 0 if is_toc else header_padding
+        full_page.paste(img_content, (0, paste_y))
+
+        if not is_toc:
+            # Only apply effects if it's NOT the table of contents
+            if should_dither:
+                # Dither logic (Images)
+                full_page = ImageEnhance.Contrast(full_page).enhance(1.2)
+                full_page = full_page.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
             else:
-                img = img.convert("L")
-                img = ImageEnhance.Contrast(img).enhance(2.0).point(lambda p: 255 if p > 140 else 0, mode='1')
-            img = img.convert("RGB")
-        draw = ImageDraw.Draw(img)
-        if header_padding > 0: draw.rectangle([0, 0, self.screen_width, header_padding], fill=(255, 255, 255))
-        if footer_padding > 0: draw.rectangle(
-            [0, self.screen_height - footer_padding, self.screen_width, self.screen_height], fill=(255, 255, 255))
-        self._draw_header(draw, global_page_index)
-        self._draw_footer(draw, global_page_index)
-        return img
+                # Text Rounding Logic (Blur + Threshold)
+                if blur_val > 0:
+                    # BLUR THE CONTENT
+                    full_page = full_page.filter(ImageFilter.GaussianBlur(radius=blur_val))
+
+                # THRESHOLD THE CONTENT
+                full_page = full_page.point(lambda p: 255 if p > threshold_val else 0, mode='L')
+
+        # --- STEP C: DRAW HEADERS/FOOTERS ON TOP (SHARP) ---
+        # We convert to RGB momentarily to allow drawing text
+        img_final = full_page.convert("RGB")
+        draw = ImageDraw.Draw(img_final)
+
+        # Clear the header/footer zones to white (erasing any blurred bleed)
+        if not is_toc:
+            if header_padding > 0:
+                draw.rectangle([0, 0, self.screen_width, header_padding], fill=(255, 255, 255))
+            if footer_padding > 0:
+                draw.rectangle([0, self.screen_height - footer_padding, self.screen_width, self.screen_height],
+                               fill=(255, 255, 255))
+
+            # Draw crisp UI text
+            self._draw_header(draw, global_page_index)
+            self._draw_footer(draw, global_page_index)
+
+        return img_final
 
     def get_xtc_bytes(self):
         if not self.is_ready: return None
@@ -878,7 +1005,13 @@ class EpubProcessor:
         prog_text = st.empty()
         for i in range(self.total_pages):
             if i % 10 == 0: prog_text.text(f"Exporting page {i + 1}/{self.total_pages}...")
-            img = self.render_page(i).convert("L").convert("1", dither=Image.Dither.FLOYDSTEINBERG)
+
+            # Get the fully composed page (with blurred body and sharp header)
+            img_rgb = self.render_page(i)
+
+            # Convert to 1-bit. Since render_page already did the thresholding, this is lossless.
+            img = img_rgb.convert("1")
+
             w, h = img.size
             xtg = struct.pack("<IHHBBIQ", 0x00475458, w, h, 0, 0, ((w + 7) // 8) * h, 0) + img.tobytes()
             idx.extend(struct.pack("<QIHH", data_off + len(blob), len(xtg), w, h))
@@ -922,7 +1055,9 @@ KEY_MAP = {
     "header_margin": "header_margin",
     "footer_font_size": "footer_font_size",
     "footer_align": "footer_align",
-    "footer_margin": "footer_margin"
+    "footer_margin": "footer_margin",
+    "text_threshold": "text_threshold",
+    "text_blur": "text_blur"
 }
 
 
@@ -934,6 +1069,8 @@ def get_current_settings_for_export():
             export_data[ctk_key] = st.session_state[st_key]
     if "font_name" not in export_data: export_data["font_name"] = "Default (System)"
     if "preview_zoom" not in export_data: export_data["preview_zoom"] = 300
+    # Include render mode
+    export_data["render_mode"] = "Auto"
     return json.dumps(export_data, indent=4)
 
 
@@ -1125,6 +1262,17 @@ def main():
             current_config['line_height'] = st.number_input("Line Height", 1.0, 3.0,
                                                             get_state("line_height", DEFAULT_LINE_HEIGHT), step=0.1,
                                                             key="line_height")
+
+            # --- NEW SLIDERS HERE ---
+            st.markdown("##### Rendering Adjustments")
+            r1, r2 = st.columns(2)
+            current_config['text_threshold'] = r1.slider("Text Sharpness", 100, 200,
+                                                         get_state("text_threshold", DEFAULT_TEXT_THRESHOLD),
+                                                         key="text_threshold")
+            current_config['text_blur'] = r2.slider("Corner Softness", 0.0, 3.0,
+                                                    get_state("text_blur", DEFAULT_TEXT_BLUR), step=0.1,
+                                                    key="text_blur")
+
             st.subheader("Margins & Padding")
 
             pad_col1, pad_col2 = st.columns(2)
