@@ -403,6 +403,9 @@ class EpubProcessor:
         Splits a single BeautifulSoup object into multiple soup objects
         based on the anchors provided in toc_entries.
         """
+        # Sort entries to ensure we process in order of appearance
+        # We need to find where these anchors physically sit in the DOM
+
         chunks = []
 
         # If the file has no anchors (just 1 chapter), return as is
@@ -415,33 +418,61 @@ class EpubProcessor:
             target = None
             if anchor:
                 target = soup.find(id=anchor)
+
+            # If we found the target, or if it's the start (anchor=None), add to list
             if target or not anchor:
                 split_points.append({'node': target, 'title': title})
 
         if not split_points:
+            # Fallback: couldn't find IDs, return whole file as first chapter
             return [{'title': toc_entries[0][1], 'soup': soup}]
 
         # 2. Iterate and extract content
+        # Strategy: Iterate over body children. Assign them to current_chapter
+        # until we hit a child that contains (or is) the next split_point.
+
         current_idx = 0
         current_soup = BeautifulSoup("<body></body>", 'html.parser')
+
         body_children = list(soup.body.children) if soup.body else []
 
         for child in body_children:
             if isinstance(child, NavigableString) and not child.strip():
+                # Just whitespace, append to current
                 if current_soup.body: current_soup.body.append(child.extract() if hasattr(child, 'extract') else child)
                 continue
 
+            # Check if we moved to the next section
+            # Is this child the start node? Or does it contain the start node?
             if current_idx + 1 < len(split_points):
                 next_node = split_points[current_idx + 1]['node']
-                if next_node and (child == next_node or (hasattr(child, 'find') and next_node in child.find_all())):
+
+                # --- FIX STARTS HERE ---
+                # Safe check: Only look inside if the child supports searching (e.g. is a Tag)
+                is_nested_target = False
+                if hasattr(child, 'find_all'):
+                    if next_node in child.find_all():
+                        is_nested_target = True
+
+                if next_node and (child == next_node or is_nested_target):
+                    # --- FIX ENDS HERE ---
+
+                    # We hit the next chapter marker!
+                    # Save current chunk
                     chunks.append({'title': split_points[current_idx]['title'], 'soup': current_soup})
+
+                    # Start new chunk
                     current_idx += 1
                     current_soup = BeautifulSoup("<body></body>", 'html.parser')
 
+            # Append child to current soup
+            # We copy it to avoid destroying original if needed, but extraction is faster
             if current_soup.body:
                 current_soup.body.append(child)
 
+        # Add the final chunk
         chunks.append({'title': split_points[current_idx]['title'], 'soup': current_soup})
+
         return chunks
 
     # --- STEP 1: PARSE STRUCTURE (FAST) ---
