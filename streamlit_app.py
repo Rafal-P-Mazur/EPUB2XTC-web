@@ -58,9 +58,17 @@ def fix_css_font_paths(css_text, target_font_family="'CustomFont'"):
 
 
 def get_font_variants(directory):
-    try:
-        all_files = [f for f in os.listdir(directory) if f.lower().endswith((".ttf", ".otf"))]
-    except:
+    """
+    Scans a directory (recursively) for font files and assigns variants.
+    """
+    all_files_paths = []
+    # Use walk to find files in subdirectories
+    for root, dirs, files in os.walk(directory):
+        for f in files:
+            if f.lower().endswith((".ttf", ".otf")):
+                all_files_paths.append(os.path.join(root, f).replace("\\", "/"))
+
+    if not all_files_paths:
         return {}
 
     candidates = {
@@ -70,12 +78,11 @@ def get_font_variants(directory):
         "bold_italic": []
     }
 
-    for f in all_files:
-        full_path = os.path.join(directory, f).replace("\\", "/")
-        name_lower = f.lower()
+    for full_path in all_files_paths:
+        name_lower = os.path.basename(full_path).lower()
 
-        has_bold = any(x in name_lower for x in ["bold", "bd"])
-        has_italic = any(x in name_lower for x in ["italic", "oblique", "obl"])
+        has_bold = any(x in name_lower for x in ["bold", "bd", "-b", "_b"])
+        has_italic = any(x in name_lower for x in ["italic", "oblique", "obl", "-i", "_i"])
 
         if has_bold and has_italic:
             candidates["bold_italic"].append(full_path)
@@ -88,6 +95,7 @@ def get_font_variants(directory):
 
     def pick_best(file_list):
         if not file_list: return None
+        # Picking the shortest path/filename often avoids "subset" fonts
         return sorted(file_list, key=len)[0]
 
     results = {
@@ -97,8 +105,9 @@ def get_font_variants(directory):
         "bold_italic": pick_best(candidates["bold_italic"])
     }
 
-    if not results["regular"] and all_files:
-        results["regular"] = os.path.join(directory, all_files[0]).replace("\\", "/")
+    # Fallback: If no "regular" found via keywords, take the first font found
+    if not results["regular"] and all_files_paths:
+        results["regular"] = all_files_paths[0]
 
     return results
 
