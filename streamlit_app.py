@@ -15,6 +15,7 @@ import json
 import zipfile
 import shutil
 from urllib.parse import unquote
+import concurrent.futures
 
 # --- CONFIGURATION DEFAULTS ---
 DEFAULT_SCREEN_WIDTH = 480
@@ -748,22 +749,22 @@ class EpubProcessor:
 
         # --- 1. GET RENDER SETTINGS ---
         mode = self.layout_settings.get("render_mode", DEFAULT_RENDER_MODE)
-
-        # Settings for Threshold pipeline
         threshold_val = self.layout_settings.get("text_threshold", DEFAULT_TEXT_THRESHOLD)
         sharpness_val = self.layout_settings.get("text_blur", DEFAULT_TEXT_BLUR)
-
-        # Settings for Dither pipeline
         white_clip = self.layout_settings.get("white_clip", DEFAULT_WHITE_CLIP)
         contrast = self.layout_settings.get("contrast", DEFAULT_CONTRAST)
 
         num_toc = len(self.toc_pages_images)
-        footer_padding, header_padding = max(0, self.bottom_padding), max(0, self.top_padding)
+        footer_padding = max(0, self.bottom_padding)
+        header_padding = max(0, self.top_padding)
         content_height = self.screen_height - footer_padding - header_padding
+        if content_height < 1: content_height = 1
 
         # --- 2. PREPARE CONTENT LAYER ---
         has_image_content = False
+
         if global_page_index < num_toc:
+            # Table of Contents
             img_content = self.toc_pages_images[global_page_index].copy().convert("L")
             is_toc = True
         else:
@@ -771,69 +772,137 @@ class EpubProcessor:
             doc_idx, page_idx = self.page_map[global_page_index - num_toc]
             doc, has_image_content = self.fitz_docs[doc_idx]
             page = doc[page_idx]
-            mat = fitz.Matrix(DEFAULT_RENDER_SCALE, DEFAULT_RENDER_SCALE)
+
+            # --- OPTIMIZATION: Direct Rendering ---
+            src_w = page.rect.width
+            src_h = page.rect.height
+
+            # Calculate exact scale to fill width/height
+            sx = self.screen_width / src_w
+            sy = content_height / src_h
+
+            mat = fitz.Matrix(sx, sy)
             pix = page.get_pixmap(matrix=mat, alpha=False)
-            img_content_raw = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
-            img_content = img_content_raw.resize((self.screen_width, content_height), Image.Resampling.LANCZOS).convert(
-                "L")
+
+            # Fast creation
+            img_content = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
 
         # --- 3. APPLY FILTERS ---
         full_page = Image.new("L", (self.screen_width, self.screen_height), 255)
         paste_y = 0 if is_toc else header_padding
-        full_page.paste(img_content, (0, paste_y))
+
+        # Center horizontally if there's a slight pixel mismatch
+        paste_x = (self.screen_width - img_content.width) // 2
+        full_page.paste(img_content, (paste_x, paste_y))
 
         if not is_toc:
-            # DECISION LOGIC:
-            # Mode "Full Dither": Always dither everything.
-            # Mode "Smart Threshold": Dither if image present, else Threshold.
-
             use_dither = False
             if mode == "Dither":
                 use_dither = True
             elif mode == "Threshold":
-                use_dither = has_image_content  # Hybrid approach
+                use_dither = has_image_content
 
             if use_dither:
-                # --- DITHER PIPELINE ---
                 if contrast != 1.0:
                     full_page = ImageEnhance.Contrast(full_page).enhance(contrast)
-                full_page = full_page.point(lambda p: 255 if p > white_clip else p)
+                if white_clip < 255:
+                    full_page = full_page.point(lambda p: 255 if p > white_clip else p)
                 full_page = full_page.convert("1", dither=Image.Dither.FLOYDSTEINBERG).convert("L")
             else:
-                # --- THRESHOLD PIPELINE ---
-                enhancer = ImageEnhance.Sharpness(full_page)
-                apply_sharp = 1.0 + (sharpness_val * 0.5)
-                full_page = enhancer.enhance(apply_sharp)
+                if sharpness_val > 0:
+                    enhancer = ImageEnhance.Sharpness(full_page)
+                    full_page = enhancer.enhance(1.0 + (sharpness_val * 0.5))
                 full_page = full_page.point(lambda p: 255 if p > threshold_val else 0).convert("L")
 
         # --- 4. OVERLAYS ---
         img_final = full_page.convert("RGB")
         draw = ImageDraw.Draw(img_final)
+
         if not is_toc:
-            if header_padding > 0: draw.rectangle([0, 0, self.screen_width, header_padding], fill=(255, 255, 255))
-            if footer_padding > 0: draw.rectangle(
-                [0, self.screen_height - footer_padding, self.screen_width, self.screen_height], fill=(255, 255, 255))
+            # Mask out header/footer areas
+            if header_padding > 0:
+                draw.rectangle([0, 0, self.screen_width, header_padding], fill=(255, 255, 255))
+            if footer_padding > 0:
+                draw.rectangle([0, self.screen_height - footer_padding, self.screen_width, self.screen_height],
+                               fill=(255, 255, 255))
+
             self._draw_header(draw, global_page_index)
             self._draw_footer(draw, global_page_index)
+
         return img_final
 
     def get_xtc_bytes(self):
         if not self.is_ready: return None
-        blob, idx = bytearray(), bytearray()
-        data_off = 56 + (16 * self.total_pages)
+
+        # We accumulate results in a list first to ensure order is maintained
+        blob_parts = [None] * self.total_pages
+        idx_parts = [None] * self.total_pages
+
+        data_off_start = 56 + (16 * self.total_pages)
+        current_data_offset = data_off_start
+
         prog_text = st.empty()
-        for i in range(self.total_pages):
-            if i % 10 == 0: prog_text.text(f"Exporting page {i + 1}/{self.total_pages}...")
+        prog_bar = st.progress(0)
+
+        # Worker function for parallel execution
+        def process_single_page(i):
             img_rgb = self.render_page(i)
             img = img_rgb.convert("1")
             w, h = img.size
-            xtg = struct.pack("<IHHBBIQ", 0x00475458, w, h, 0, 0, ((w + 7) // 8) * h, 0) + img.tobytes()
-            idx.extend(struct.pack("<QIHH", data_off + len(blob), len(xtg), w, h))
-            blob.extend(xtg)
-        header = struct.pack("<IHHBBBBIQQQQQ", 0x00435458, 0x0100, self.total_pages, 0, 0, 0, 0, 0, 0, 56, data_off, 0,
-                             0)
+            img_bytes = img.tobytes()
+            # XTG Header
+            xtg = struct.pack("<IHHBBIQ", 0x00475458, w, h, 0, 0, ((w + 7) // 8) * h, 0) + img_bytes
+            return i, xtg, w, h
+
+        # Parallel Execution
+        # Use simple os.cpu_count() for max workers
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            # Submit all tasks
+            futures = [executor.submit(process_single_page, i) for i in range(self.total_pages)]
+
+            count = 0
+            for future in concurrent.futures.as_completed(futures):
+                count += 1
+                # Update UI periodically (every 5% or so to reduce overhead)
+                if count % max(1, self.total_pages // 20) == 0:
+                    prog_text.text(f"Exporting page {count}/{self.total_pages}...")
+                    prog_bar.progress(count / self.total_pages)
+
+                # Retrieve result
+                i, xtg_blob, w, h = future.result()
+                blob_parts[i] = xtg_blob
+
+                # We can't generate the Index here yet because the offset depends on previous pages.
+                # We store the size/dims and calculate offsets sequentially after the loop.
+                idx_parts[i] = (len(xtg_blob), w, h)
+
+        # Sequential Offset Calculation
+        final_idx = bytearray()
+        final_blob = bytearray()
+
+        for i in range(self.total_pages):
+            size, w, h = idx_parts[i]
+            chunk = blob_parts[i]
+
+            # Add Index Entry
+            final_idx.extend(struct.pack("<QIHH", current_data_offset, size, w, h))
+
+            # Add Blob
+            final_blob.extend(chunk)
+
+            current_data_offset += size
+
+        # Final Header
+        header = struct.pack("<IHHBBBBIQQQQQ",
+                             0x00435458, 0x0100, self.total_pages,
+                             0, 0, 0, 0, 0, 0,
+                             56, data_off_start,
+                             0, 0)
+
         prog_text.empty()
-        return io.BytesIO(header + idx + blob)
+        prog_bar.empty()
+
+        return io.BytesIO(header + final_idx + final_blob)
 
 
 # --- STREAMLIT APP ---
